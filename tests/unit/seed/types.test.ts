@@ -16,6 +16,25 @@ describe("SeedConnectionSchema", () => {
     expect(result.success).toBe(true);
   });
 
+  /**
+   * The silent half of the round-trip (#765). Unlike the three
+   * `Record<keyof DatabaseConnection, ...>` maps, a zod object STRIPS a key it does not
+   * declare, so a seed file setting this on an owner holding tens of thousands of objects
+   * would validate, lose the field, and scan the catalog anyway with nothing to show for
+   * it. Nothing fails at compile time here, so it is pinned at run time.
+   */
+  it("carries a connection's no-scan choice through validation", () => {
+    const result = SeedConnectionSchema.safeParse({ ...validConn, skipObjectScan: true });
+    expect(result.success).toBe(true);
+    expect(result.data?.skipObjectScan).toBe(true);
+  });
+
+  it("leaves the no-scan choice absent when the seed does not make one", () => {
+    const result = SeedConnectionSchema.safeParse(validConn);
+    expect(result.success).toBe(true);
+    expect(result.data?.skipObjectScan).toBeUndefined();
+  });
+
   it("rejects invalid id format (uppercase)", () => {
     const result = SeedConnectionSchema.safeParse({ ...validConn, id: "INVALID" });
     expect(result.success).toBe(false);
@@ -214,6 +233,42 @@ describe("SeedConnectionSchema: Cassandra's localDataCenter", () => {
       type: "cassandra",
       host: "cassandra.internal",
       localDataCenter: 1,
+      roles: ["*"],
+    });
+
+    expect(result.success).toBe(false);
+  });
+});
+
+describe("SeedConnectionSchema: Elasticsearch's API key pair", () => {
+  it("accepts a seeded Elasticsearch connection that carries the pair", () => {
+    const result = SeedConnectionSchema.safeParse({
+      id: "logs",
+      name: "Logs",
+      type: "elasticsearch",
+      host: "es.internal",
+      port: 9200,
+      apiKeyId: "seed-key-id",
+      apiKeySecret: "seed-key-secret",
+      roles: ["*"],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.apiKeyId).toBe("seed-key-id");
+      expect(result.data.apiKeySecret).toBe("seed-key-secret");
+    }
+  });
+
+  it("rejects the pair on OpenSearch rather than stripping it", () => {
+    const result = SeedConnectionSchema.safeParse({
+      id: "logs",
+      name: "Logs",
+      type: "opensearch",
+      host: "os.internal",
+      port: 9200,
+      apiKeyId: "seed-key-id",
+      apiKeySecret: "seed-key-secret",
       roles: ["*"],
     });
 

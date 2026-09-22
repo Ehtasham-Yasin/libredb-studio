@@ -1,7 +1,8 @@
-import type { TableSchema, ColumnSchema, IndexSchema, ForeignKeySchema } from "@/lib/types";
+import type { ColumnSchema, IndexSchema, ForeignKeySchema } from "@/lib/types";
+import type { StoredObject } from "@/lib/db/detailed-object";
 import type { SchemaDiff, TableDiff, ColumnDiff, IndexDiff, ForeignKeyDiff } from "./types";
 
-function diffColumns(sourceCols: ColumnSchema[], targetCols: ColumnSchema[]): ColumnDiff[] {
+function diffColumns(sourceCols: readonly ColumnSchema[], targetCols: readonly ColumnSchema[]): ColumnDiff[] {
   const diffs: ColumnDiff[] = [];
   const sourceMap = new Map(sourceCols.map((c) => [c.name, c]));
   const targetMap = new Map(targetCols.map((c) => [c.name, c]));
@@ -15,6 +16,7 @@ function diffColumns(sourceCols: ColumnSchema[], targetCols: ColumnSchema[]): Co
         targetType: col.type,
         targetNullable: col.nullable,
         targetDefault: col.defaultValue,
+        targetDefaultSql: col.defaultExpression,
         targetIsPrimary: col.isPrimary,
         changes: [`Added column "${name}" (${col.type})`],
       });
@@ -49,8 +51,23 @@ function diffColumns(sourceCols: ColumnSchema[], targetCols: ColumnSchema[]): Co
     if (sourceCol.nullable !== targetCol.nullable) {
       changes.push(`Nullable changed: ${sourceCol.nullable} → ${targetCol.nullable}`);
     }
-    if ((sourceCol.defaultValue || "") !== (targetCol.defaultValue || "")) {
-      changes.push(`Default changed: ${sourceCol.defaultValue || "none"} → ${targetCol.defaultValue || "none"}`);
+    // Compare the SQL TEXT where the provider gave one, which is the quantity the migration
+    // generator emits, and fall back to the value where it did not. Presence, not truthiness:
+    // MariaDB reports `DEFAULT ''` as the value "" with the expression "''", and a column
+    // with no default at all as neither field, so a `||` fallback collapses the two onto the
+    // same string and reports no change for a real difference, in both directions. Reading
+    // the text first also makes a snapshot taken before the decoding, which stored the
+    // catalog text in `defaultValue`, compare EQUAL to the same unchanged table read today.
+    // One stale case it does NOT settle, measured and accepted rather than repaired: a
+    // pre-decoding MariaDB snapshot stored the four-character keyword `NULL` for a column
+    // with NO default, and today that column carries neither field, so such a snapshot
+    // reports one "Default changed: NULL -> none" per no-default column and one MODIFY that
+    // changes nothing. Reading the keyword as absence here would put back the very ambiguity
+    // #795 removed, since `NULL` is also a value a column can really default to.
+    const sourceDefault = sourceCol.defaultExpression ?? sourceCol.defaultValue;
+    const targetDefault = targetCol.defaultExpression ?? targetCol.defaultValue;
+    if (sourceDefault !== targetDefault) {
+      changes.push(`Default changed: ${sourceDefault ?? "none"} → ${targetDefault ?? "none"}`);
     }
     if (sourceCol.isPrimary !== targetCol.isPrimary) {
       changes.push(`Primary key changed: ${sourceCol.isPrimary} → ${targetCol.isPrimary}`);
@@ -66,6 +83,7 @@ function diffColumns(sourceCols: ColumnSchema[], targetCols: ColumnSchema[]): Co
         targetNullable: targetCol.nullable,
         sourceDefault: sourceCol.defaultValue,
         targetDefault: targetCol.defaultValue,
+        targetDefaultSql: targetCol.defaultExpression,
         sourceIsPrimary: sourceCol.isPrimary,
         targetIsPrimary: targetCol.isPrimary,
         changes,
@@ -76,7 +94,7 @@ function diffColumns(sourceCols: ColumnSchema[], targetCols: ColumnSchema[]): Co
   return diffs;
 }
 
-function diffIndexes(sourceIndexes: IndexSchema[], targetIndexes: IndexSchema[]): IndexDiff[] {
+function diffIndexes(sourceIndexes: readonly IndexSchema[], targetIndexes: readonly IndexSchema[]): IndexDiff[] {
   const diffs: IndexDiff[] = [];
 
   // Build a stable map key from the column set. Copy before sorting so the
@@ -152,7 +170,10 @@ function diffIndexes(sourceIndexes: IndexSchema[], targetIndexes: IndexSchema[])
   return diffs;
 }
 
-function diffForeignKeys(sourceFKs: ForeignKeySchema[], targetFKs: ForeignKeySchema[]): ForeignKeyDiff[] {
+function diffForeignKeys(
+  sourceFKs: readonly ForeignKeySchema[],
+  targetFKs: readonly ForeignKeySchema[],
+): ForeignKeyDiff[] {
   const diffs: ForeignKeyDiff[] = [];
 
   const makeKey = (fk: ForeignKeySchema) => `${fk.columnName}→${fk.referencedTable}.${fk.referencedColumn}`;
@@ -187,7 +208,27 @@ function diffForeignKeys(sourceFKs: ForeignKeySchema[], targetFKs: ForeignKeySch
   return diffs;
 }
 
-export function diffSchemas(source: TableSchema[], target: TableSchema[]): SchemaDiff {
+/**
+ * Two readings of a database, compared BY NAME (#789).
+ *
+ * The name is the key and not the path or the kind, and that is a compatibility decision with a
+ * measured reason rather than a shortcut. Both sides of this comparison may be a `SchemaSnapshot`
+ * out of the user's own storage, and a snapshot written before the object model carries no `kind`
+ * and no `path` at all. Keying on either would report every object in such a snapshot as REMOVED
+ * and every object in the current reading as ADDED, the first time somebody opened an old
+ * snapshot against a live database: a diff that invents every change there is. Nothing migrates
+ * those records, so `StoredObject` is the shape that enters here and NAME is the only field both
+ * populations are guaranteed to spell.
+ *
+ * What survives, and predates all of this: two entries colliding on one name leave `new Map()`
+ * holding the last of them.
+ *
+ * The cost, stated rather than left to be discovered: this cannot say that a table became a
+ * view. Both sides now CARRY the kind when both are current readings, so the comparison could be
+ * taught to notice it for a pair that has one; doing that while an old snapshot may be the other
+ * side means deciding what a kind-versus-no-kind pair means, which is Phase 2's to settle.
+ */
+export function diffSchemas(source: readonly StoredObject[], target: readonly StoredObject[]): SchemaDiff {
   const sourceMap = new Map(source.map((t) => [t.name, t]));
   const targetMap = new Map(target.map((t) => [t.name, t]));
 
@@ -208,6 +249,7 @@ export function diffSchemas(source: TableSchema[], target: TableSchema[]): Schem
           targetType: c.type,
           targetNullable: c.nullable,
           targetDefault: c.defaultValue,
+          targetDefaultSql: c.defaultExpression,
           targetIsPrimary: c.isPrimary,
           changes: [`Added column "${c.name}" (${c.type})`],
         })),

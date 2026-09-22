@@ -7,7 +7,8 @@ import { createErrorResponse } from "@/lib/api/errors";
 import { resolveConnection } from "@/lib/seed/resolve-connection";
 import { guardRoute } from "@/lib/api/require-session";
 import type { DatabaseType, QueryWarning } from "@/lib/types";
-import type { DatabaseProvider } from "@/lib/db/types";
+import { endsOpenQueryTransactions, newQueryCallScope } from "@/lib/db/types";
+import type { DatabaseProvider, OpenQueryTransactionOutcome } from "@/lib/db/types";
 
 export interface StatementResult {
   index: number;
@@ -61,6 +62,7 @@ async function runStatement(
   isLast: boolean,
   dialect: DatabaseType,
   options: Record<string, unknown>,
+  scope: string,
 ): Promise<StatementResult> {
   const startTime = performance.now();
   const identity = { index, sql: stmt.sql, startLine: stmt.startLine };
@@ -80,7 +82,11 @@ async function runStatement(
         ? provider.prepareQuery(stmt.sql, options)
         : { query: stmt.sql, wasLimited: false, limit: 0, offset: 0 };
 
-    const result = await provider.query(prepared.query);
+    // Every statement of the script runs under the SAME scope, which is what lets the
+    // `finally` below end a transaction any of them left open — including one opened by a
+    // statement whose own client is not the last one the script borrowed (D87). No params
+    // and no queryId here: this route binds nothing and cancels nothing.
+    const result = await provider.query(prepared.query, undefined, undefined, scope);
 
     return {
       ...identity,
@@ -129,21 +135,61 @@ export async function POST(req: NextRequest) {
     const provider = await getOrCreateProvider(connection);
     const results: StatementResult[] = [];
     let totalExecutionTime = 0;
+    let openTransaction: OpenQueryTransactionOutcome = "none";
+    // This request's own name for everything it runs, minted here and passed to every
+    // statement and to the ender, so that the transaction ended below is one THIS script
+    // left open and never another caller's (D87).
+    const scope = newQueryCallScope();
 
-    for (let i = 0; i < statements.length; i++) {
-      const outcome = await runStatement(
-        provider,
-        statements[i],
-        i,
-        i === statements.length - 1,
-        connection.type,
-        options,
-      );
-      totalExecutionTime += outcome.executionTime;
-      results.push(outcome);
+    // MAY A SCRIPT LEAVE A TRANSACTION OPEN? No, and this finally is the answer.
+    //
+    // The provider this route borrows is cached per `connection.id` for the whole
+    // process (`getOrCreateProvider`), so a transaction that outlives the request does
+    // not belong to the person who opened it any more — it belongs to whoever borrows
+    // the handle next. Measured 2026-09-13 through this route: `BEGIN; CREATE TABLE ...;
+    // SELECT * FROM <missing>` broke out of the loop below and the transaction stayed
+    // open. On PostgreSQL 17 the next request, a DIFFERENT user on POST /api/db/query,
+    // answered HTTP 500 "current transaction is aborted, commands ignored until end of
+    // transaction block", and so did POST /api/db/maintenance eight minutes later; on
+    // SQLite and DuckDB the same script cost the next user's write silently.
+    //
+    // So the transaction ends here, whether the script failed or ran clean, and the
+    // response says what became of it — a user who wrote BEGIN with no COMMIT is told.
+    // It is a finally and not a line after the loop because the loop must not be able to
+    // leave by any path that skips this.
+    //
+    // WHOSE transaction it ends is now named rather than hoped for: the provider is cached
+    // per connection id and shared by every concurrent request on that stored connection,
+    // and until D87 this call reached whichever client anybody had recorded last — measured
+    // rolling a concurrent script's and an interactive session's work away. The `scope`
+    // above is this request's own, and nothing it did not run on can be ended here.
+    //
+    // What it is NOT: a guard on the word BEGIN. The same shape arrives from a BEGIN
+    // inside a statement the splitter cannot see through, so the leak is the missing
+    // rollback and not the keyword. And it is not an unconditional ROLLBACK either:
+    // measured on bun:sqlite 1.4.2 and DuckDB v1.5.5, a rollback with no transaction
+    // active raises, so the provider is asked rather than told.
+    try {
+      for (let i = 0; i < statements.length; i++) {
+        const outcome = await runStatement(
+          provider,
+          statements[i],
+          i,
+          i === statements.length - 1,
+          connection.type,
+          options,
+          scope,
+        );
+        totalExecutionTime += outcome.executionTime;
+        results.push(outcome);
 
-      // Stop execution on error
-      if (outcome.status === "error") break;
+        // Stop execution on error
+        if (outcome.status === "error") break;
+      }
+    } finally {
+      if (endsOpenQueryTransactions(provider)) {
+        openTransaction = await provider.endOpenQueryTransaction(scope);
+      }
     }
 
     // Return the last successful result with rows as the main result (for ResultsGrid)
@@ -164,6 +210,10 @@ export async function POST(req: NextRequest) {
       ...carriedChannels(lastResultWithRows),
       // Multi-statement metadata
       multiStatement: true,
+      // Present only when there was a transaction to end, following the same rule as the
+      // two channels above: the client renders the notice from the field's presence
+      // alone, so an always-present "none" would announce something that did not happen.
+      ...(openTransaction === "rolled-back" && { openTransaction }),
       statementCount: statements.length,
       executedCount: results.length,
       hasError,

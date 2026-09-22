@@ -13,12 +13,15 @@
   <a href="README_zh.md">简体中文</a> ·
   <a href="README_ja.md">日本語</a> ·
   <b>Español</b> ·
-  <a href="README_ur.md">اردو</a>
+  <a href="README_ur.md">اردو</a> ·
+  <a href="README_hi.md">हिन्दी</a>
 </p>
 
 <p align="center">
   Listado por el proyecto PostgreSQL:
   <a href="https://www.postgresql.org/about/news/libredb-studio-an-open-source-self-hosted-sql-ide-for-postgresql-in-the-browser-3368/">News</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/PostgreSQL_Clients#LibreDB_Studio">PostgreSQL Clients</a>
   ·
   <a href="https://www.postgresql.org/download/products/1/">Software Catalogue</a>
   ·
@@ -27,11 +30,14 @@
 <p align="center">
   Listado también en la documentación oficial de
   <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
-  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>
+  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>,
   <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>,
-  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>
+  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>,
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>,
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>,
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>
   y
-  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>
+  <a href="https://opensearch.org/community-projects/">OpenSearch</a>
 </p>
 
 <p align="center">
@@ -44,6 +50,8 @@
   <a href="https://codecov.io/github/libredb/libredb-studio"><img src="https://codecov.io/github/libredb/libredb-studio/graph/badge.svg?token=VA6CO9R7IH" alt="Coverage"></a>
   <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio" alt="Artifact Hub"></a>
 </p>
+
+> Este README en español es una traducción de la comunidad y puede ir por detrás del inglés. Si difieren, manda la [versión en inglés](README.md).
 
 ## Inicio rápido
 
@@ -206,7 +214,7 @@ Studio es MIT porque tiene que poder ir a cualquier parte. Lo que se cobra es li
 
 ## Pruebas y calidad
 
-- Seis capas de pruebas: unitarias, de API, de integración, de hooks, de componentes y end-to-end
+- Siete capas de pruebas: unitarias, de API, de integración, de hooks, de seguridad, de evaluaciones y de componentes, más las end-to-end
 - **Cobertura de líneas del 100%**, y es una barrera dura en CI. Si la cobertura baja, el merge se bloquea
 - Quality gate de SonarCloud
 - Pruebas de humo en Node 24 y 26 en cada release

@@ -659,6 +659,22 @@ function makeModifiedColumnDiff(col: Partial<ColumnDiff>): SchemaDiff {
   };
 }
 
+function makeClickhouseAddedColumnDiff(col: Partial<ColumnDiff>): SchemaDiff {
+  return {
+    tables: [
+      {
+        action: "modified",
+        tableName: "events",
+        columns: [{ action: "added", columnName: "y", changes: ["Added"], ...col }],
+        indexes: [],
+        foreignKeys: [],
+      },
+    ],
+    summary: { added: 0, removed: 0, modified: 1 },
+    hasChanges: true,
+  };
+}
+
 describe("generateMigrationSQL: ClickHouse ALTER", () => {
   test("modified column uses MODIFY COLUMN, not PostgreSQL ALTER COLUMN", () => {
     const sql = generateMigrationSQL(makeModifiedTableDiff(), "clickhouse");
@@ -707,6 +723,66 @@ describe("generateMigrationSQL: ClickHouse ALTER", () => {
       "clickhouse",
     );
     expect(sql).toContain('ALTER TABLE "events" MODIFY COLUMN "note" Int32 MATERIALIZED toYear(d);');
+    expect(sql).not.toContain("DEFAULT MATERIALIZED");
+  });
+
+  test("an added column with a MATERIALIZED default is emitted verbatim too", () => {
+    const sql = generateMigrationSQL(
+      makeClickhouseAddedColumnDiff({ targetType: "Int32", targetDefault: "MATERIALIZED toYear(d)" }),
+      "clickhouse",
+    );
+    expect(sql).toContain('ALTER TABLE "events" ADD COLUMN "y" Int32 MATERIALIZED toYear(d);');
+    expect(sql).not.toContain("DEFAULT MATERIALIZED");
+  });
+
+  test("an added column with an ALIAS or EPHEMERAL default names its own clause", () => {
+    const alias = generateMigrationSQL(
+      makeClickhouseAddedColumnDiff({ targetType: "Int32", targetDefault: "ALIAS toYear(d)" }),
+      "clickhouse",
+    );
+    expect(alias).toContain('ADD COLUMN "y" Int32 ALIAS toYear(d);');
+    const ephemeral = generateMigrationSQL(
+      makeClickhouseAddedColumnDiff({ targetType: "String", targetDefault: "EPHEMERAL 'e'" }),
+      "clickhouse",
+    );
+    expect(ephemeral).toContain("ADD COLUMN \"y\" String EPHEMERAL 'e';");
+    expect(alias + ephemeral).not.toContain("DEFAULT ALIAS");
+    expect(alias + ephemeral).not.toContain("DEFAULT EPHEMERAL");
+  });
+
+  test("an added column with a plain default keeps the DEFAULT keyword", () => {
+    const sql = generateMigrationSQL(
+      makeClickhouseAddedColumnDiff({ targetType: "String", targetDefault: "'n/a'" }),
+      "clickhouse",
+    );
+    expect(sql).toContain("ADD COLUMN \"y\" String DEFAULT 'n/a';");
+  });
+
+  test("CREATE TABLE emits a MATERIALIZED column without the DEFAULT keyword", () => {
+    const diff: SchemaDiff = {
+      tables: [
+        {
+          action: "added",
+          tableName: "events",
+          columns: [
+            { action: "added", columnName: "d", targetType: "Date", changes: ["Added"] },
+            {
+              action: "added",
+              columnName: "y",
+              targetType: "Int32",
+              targetDefault: "MATERIALIZED toYear(d)",
+              changes: ["Added"],
+            },
+          ],
+          indexes: [],
+          foreignKeys: [],
+        },
+      ],
+      summary: { added: 1, removed: 0, modified: 0 },
+      hasChanges: true,
+    };
+    const sql = generateMigrationSQL(diff, "clickhouse");
+    expect(sql).toContain('"y" Int32 MATERIALIZED toYear(d)');
     expect(sql).not.toContain("DEFAULT MATERIALIZED");
   });
 
@@ -1348,5 +1424,141 @@ describe("generateMigrationSQL: multi-table batch", () => {
     expect(sql).toContain('DROP TABLE IF EXISTS "legacy"');
     expect(sql).toContain('CREATE TABLE "new_table"');
     expect(sql).toContain('ALTER TABLE "users" ADD COLUMN "phone"');
+  });
+});
+
+// ============================================================================
+// The text that goes after DEFAULT (#795)
+// ============================================================================
+
+/**
+ * `targetDefault` is the VALUE the column defaults to and `targetDefaultSql` is the SQL that
+ * produces it, as the engine's own catalog spells it. Every site that emits a DEFAULT clause
+ * must prefer the second: measured on MariaDB 12.3.2, `CREATE TABLE t (note varchar(20)
+ * DEFAULT abc)` is ERROR 1054 (42S22) Unknown column 'abc' in 'DEFAULT', while
+ * `DEFAULT 'abc'` is accepted.
+ */
+function makeAddedColumnDiff(col: Partial<ColumnDiff>): SchemaDiff {
+  return {
+    tables: [
+      {
+        action: "modified",
+        tableName: "events",
+        columns: [{ action: "added", columnName: "note", targetType: "varchar(20)", changes: ["Added"], ...col }],
+        indexes: [],
+        foreignKeys: [],
+      },
+    ],
+    summary: { added: 0, removed: 0, modified: 1 },
+    hasChanges: true,
+  };
+}
+
+describe("generateMigrationSQL: a default is emitted as SQL, not as its value", () => {
+  test("a string default is emitted quoted, the way the catalog spells it", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({ targetDefault: "abc", targetDefaultSql: "'abc'" }), "mysql");
+    expect(sql).toContain("ADD COLUMN `note` varchar(20) DEFAULT 'abc';");
+    expect(sql).not.toContain("DEFAULT abc");
+  });
+
+  test("an empty-string default survives, where the value alone would be falsy", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({ targetDefault: "", targetDefaultSql: "''" }), "mysql");
+    expect(sql).toContain("ADD COLUMN `note` varchar(20) DEFAULT '';");
+  });
+
+  test("a BIT default keeps its b'' literal", () => {
+    const sql = generateMigrationSQL(
+      makeAddedColumnDiff({ targetType: "bit(1)", targetDefault: "b'1'", targetDefaultSql: "b'1'" }),
+      "mysql",
+    );
+    expect(sql).toContain("ADD COLUMN `note` bit(1) DEFAULT b'1';");
+  });
+
+  test("a column with no default at all emits no DEFAULT clause", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({}), "mysql");
+    expect(sql).toContain("ADD COLUMN `note` varchar(20);");
+    expect(sql).not.toContain("DEFAULT");
+  });
+
+  // The same pre-existing defect from the other side, and the reason the emission gates test
+  // PRESENCE and not truthiness. `diffColumns` reports a column whose default changed TO the
+  // empty string, so a truthiness gate drops the clause and the migration silently does not
+  // carry the change the panel promised. Presence keeps the two halves saying one thing. What
+  // MySQL emits for it is still not SQL, for the reason above, and a statement the server
+  // rejects is the honest form of that defect rather than one that quietly does nothing.
+  test("a MySQL empty-string default still emits a clause rather than vanishing from the migration", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({ targetDefault: "" }), "mysql");
+    expect(sql).toContain("ADD COLUMN `note` varchar(20) DEFAULT ;");
+  });
+
+  test("a MODIFY COLUMN carries an empty-string default the same way", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({ targetType: "varchar(20)", targetDefault: "", targetDefaultSql: "''" }),
+      "mysql",
+    );
+    expect(sql).toContain("MODIFY COLUMN `note` varchar(20) NULL DEFAULT '';");
+  });
+
+  // Pinning a PRE-EXISTING DEFECT, deliberately left untouched by #795. MySQL's
+  // COLUMN_DEFAULT is the evaluated value and its EXTRA cannot say whether that text is SQL:
+  // `abc` is a value, `b'1'` and `0x616263` are SQL, and all three carry an empty EXTRA. So
+  // the MySQL provider declares no `targetDefaultSql`, and a string default still emits
+  // `DEFAULT abc`, which the server rejects. Fixing that needs a per-type decoding the
+  // catalog does not support, and widening #795 to it is not wanted.
+  test("a MySQL string default still emits unquoted, which is the known defect this change does not fix", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({ targetDefault: "abc" }), "mysql");
+    expect(sql).toContain("ADD COLUMN `note` varchar(20) DEFAULT abc;");
+  });
+
+  test("MySQL MODIFY COLUMN prefers the SQL text", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({ targetType: "varchar(20)", targetDefault: "abc", targetDefaultSql: "'abc'" }),
+      "mysql",
+    );
+    expect(sql).toContain("MODIFY COLUMN `note` varchar(20) NULL DEFAULT 'abc';");
+  });
+
+  test("Oracle MODIFY prefers the SQL text", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({ targetType: "VARCHAR2(20)", targetDefault: "abc", targetDefaultSql: "'abc'" }),
+      "oracle",
+    );
+    expect(sql).toContain(`MODIFY ("note" VARCHAR2(20) DEFAULT 'abc' NULL);`);
+  });
+
+  test("SQL Server ADD DEFAULT prefers the SQL text", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({ targetType: "nvarchar(20)", targetDefault: "abc", targetDefaultSql: "'abc'" }),
+      "mssql",
+    );
+    expect(sql).toContain(`ADD DEFAULT 'abc' FOR [note];`);
+  });
+
+  test("PostgreSQL SET DEFAULT prefers the SQL text", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({ targetType: "varchar(20)", targetDefault: "abc", targetDefaultSql: "'abc'" }),
+      "postgres",
+    );
+    expect(sql).toContain(`SET DEFAULT 'abc';`);
+  });
+
+  // The ClickHouse arm reads the TEXT for its kind keyword, so it has to read the same text
+  // it emits, or a MATERIALIZED property would be emitted behind a DEFAULT keyword.
+  test("the ClickHouse kind is read from the SQL text it emits", () => {
+    const sql = generateMigrationSQL(
+      makeModifiedColumnDiff({
+        targetType: "Int32",
+        targetDefault: "toYear(d)",
+        targetDefaultSql: "MATERIALIZED toYear(d)",
+      }),
+      "clickhouse",
+    );
+    expect(sql).toContain('MODIFY COLUMN "note" Int32 MATERIALIZED toYear(d);');
+    expect(sql).not.toContain("DEFAULT MATERIALIZED");
+  });
+
+  test("a dialect whose provider declares no SQL text is unchanged", () => {
+    const sql = generateMigrationSQL(makeAddedColumnDiff({ targetDefault: "42" }), "postgres");
+    expect(sql).toContain(`ADD COLUMN "note" varchar(20) DEFAULT 42;`);
   });
 });

@@ -89,6 +89,8 @@ Thumbs.db
 !.claude/skills
 .orchids/
 .codegraph/
+.claude/
+
 
 testdb
 testdb-shm
@@ -124,6 +126,11 @@ data-e2e-offline/
 # against the working directory, so running an agent locally writes run ledgers here.
 .workflow-data/
 *.libredb
+# The default target of `bun docker/libredb-init/01-object-fixture.ts`, which the fixture
+# module documents as a hand-run for a durable file (#789). `*.libredb` covers the database
+# but not the directory or the `.lock` sidecar beside it, so the documented run left an
+# untracked directory in the repository root.
+/.libredb-fixture/
 
 docs/superpowers/
 
@@ -194,6 +201,12 @@ deploy/digitalocean/droplet/scripts/99-img-check.sh
 data-e2e-base-path/
 .reviews/
 reviews/
+.wikipedia/
 
 # Superpowers brainstorming companion (local session artifacts)
 .superpowers/
+# research build output
+research/**/dist/
+# but the sweep logs are evidence published with the paper, not build noise;
+# the global *.log rule above would drop all 160 of them without saying so
+!research/**/anc/sweep-logs/*.log

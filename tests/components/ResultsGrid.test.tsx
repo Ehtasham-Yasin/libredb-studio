@@ -90,7 +90,13 @@ mock.module("@/components/results-grid/ResultCard", () => ({
   ResultCard: (props: Record<string, unknown>) =>
     React.createElement(
       "div",
-      { "data-testid": "result-card", "data-index": props.index },
+      {
+        "data-testid": "result-card",
+        "data-index": props.index,
+        // The card decides its own preview fields from this list, so what it is HANDED is
+        // the whole of the question here (#870).
+        "data-fields": (props.fields as string[]).join(","),
+      },
       React.createElement(
         "button",
         {
@@ -105,7 +111,13 @@ mock.module("@/components/results-grid/ResultCard", () => ({
 
 mock.module("@/components/results-grid/RowDetailSheet", () => ({
   RowDetailSheet: (props: Record<string, unknown>) =>
-    props.isOpen ? React.createElement("div", { "data-testid": "row-detail-sheet" }, "Row Detail") : null,
+    props.isOpen
+      ? React.createElement(
+          "div",
+          { "data-testid": "row-detail-sheet", "data-row-index": String(props.rowIndex) },
+          "Row Detail",
+        )
+      : null,
 }));
 
 mock.module("@/components/results-grid/StatsBar", () => ({
@@ -156,6 +168,13 @@ mock.module("@/components/results-grid/StatsBar", () => ({
             `${(props.pendingChanges as unknown[]).length} changes`,
           )
         : null,
+      props.onToggleWrapText
+        ? React.createElement(
+            "button",
+            { "data-testid": "wrap-toggle", onClick: props.onToggleWrapText as () => void },
+            "WRAP",
+          )
+        : null,
       (props.activeFilterCount as number) > 0
         ? React.createElement(
             "button",
@@ -163,22 +182,46 @@ mock.module("@/components/results-grid/StatsBar", () => ({
             "Clear Filters",
           )
         : null,
-    ),
-  LoadMoreFooter: (props: Record<string, unknown>) =>
-    props.hasMore
-      ? React.createElement(
-          "div",
-          { "data-testid": "load-more-footer" },
-          React.createElement(
+      // The notice itself is rendered and worded in StatsBar; what this file is about is
+      // the DECISION ResultsGrid makes, so the mock only reports the prop it was handed.
+      props.orderAcrossPagesUnspecified
+        ? React.createElement("span", { "data-testid": "order-notice" }, "order notice")
+        : null,
+      // Same for the load-more control. It used to be a separate `LoadMoreFooter` export
+      // rendered BELOW the grid, and this file stubbed that too; the control now lives in
+      // the stats strip, so the only thing left for ResultsGrid to get right is whether it
+      // hands down an offer at all, and with what page size. Rendering it inside the
+      // stats-bar stub is also what lets a test assert the grid grew no chrome below.
+      // The menu is rendered and worded in StatsBar; what this file is about is whether
+      // ResultsGrid hands down a writer and what that writer does to the table, so the
+      // stub only reports the prop and flips one known field through it.
+      props.onToggleColumn
+        ? React.createElement(
             "button",
-            { onClick: props.onLoadMore as () => void, "data-testid": "load-more-btn" },
-            "Load More (500 rows)",
-          ),
-        )
-      : null,
+            {
+              "data-testid": "toggle-column",
+              "data-hidden": [...((props.hiddenColumns as Set<string>) ?? [])].join(","),
+              onClick: () => (props.onToggleColumn as (f: string) => void)("name"),
+            },
+            "toggle name",
+          )
+        : null,
+      props.pageOffer
+        ? React.createElement(
+            "button",
+            {
+              "data-testid": "page-offer",
+              "data-loading": String(props.isLoadingMore === true),
+              onClick: (props.pageOffer as { onLoadMore: () => void }).onLoadMore,
+            },
+            `offer ${(props.pageOffer as { pageSize: number }).pageSize}`,
+          )
+        : null,
+    ),
 }));
 
 // ── Mock @tanstack/react-virtual ────────────────────────────────────────────
+const mockVirtualizerMeasure = mock(() => {});
 mock.module("@tanstack/react-virtual", () => ({
   useVirtualizer: (opts: { count: number }) => ({
     getVirtualItems: () =>
@@ -189,6 +232,8 @@ mock.module("@tanstack/react-virtual", () => ({
         key: i,
       })),
     getTotalSize: () => opts.count * 36,
+    measureElement: () => {},
+    measure: mockVirtualizerMeasure,
   }),
 }));
 
@@ -264,7 +309,7 @@ function findContextMenuForMode(
           ? candidate.querySelector('[data-testid="result-card"]') !== null
           : mode === "mobile"
             ? triggerChild?.tagName === "BUTTON"
-            : triggerChild?.getAttribute("data-index") !== null;
+            : candidate.closest("[data-desktop-grid]") !== null;
       return isMode && candidate.textContent?.includes(text);
     },
   );
@@ -283,10 +328,12 @@ function findDesktopCell(container: HTMLElement, text: string): HTMLElement | un
     : undefined;
 }
 
+// Both tables key their rows by `data-index` now that the mobile one measures its own
+// wrapped height, so the desktop grid has to be named to reach only its rows.
 function findDesktopRow(container: HTMLElement, text: string): HTMLElement | undefined {
-  return Array.from(container.querySelectorAll<HTMLElement>("[data-index]:not([data-testid])")).find((row) =>
-    row.textContent?.includes(text),
-  );
+  return Array.from(
+    container.querySelectorAll<HTMLElement>("[data-desktop-grid] [data-index]:not([data-testid])"),
+  ).find((row) => row.textContent?.includes(text));
 }
 
 // =============================================================================
@@ -482,6 +529,56 @@ describe("ResultsGrid", () => {
     await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Charles"));
   });
 
+  test("copies the filtered desktop cell by its place in the result, not in the filter", async () => {
+    // The desktop table is built over the FILTERED rows, so TanStack's `row.index` is a
+    // position in that array, while a pending change and a reveal are both addressed by
+    // the position in `result.rows`. Copy has to read the same number the cell drew, or
+    // it puts a value on the clipboard that is not the one on screen.
+    const result: QueryResult = {
+      rows: [
+        { id: 1, name: "Alice" },
+        { id: 2, name: "Bob" },
+        { id: 3, name: "Charlie" },
+      ],
+      fields: ["id", "name"],
+      rowCount: 3,
+      executionTime: 1,
+    };
+    const pendingChanges: CellChange[] = [
+      { rowIndex: 2, columnId: "name", originalValue: "Charlie", newValue: "Charles" },
+    ];
+    const { container, getByTestId } = render(
+      React.createElement(ResultsGrid, { result, editingEnabled: true, pendingChanges }),
+    );
+    fireEvent.click(getByTestId("view-table"));
+
+    fireEvent.click(container.querySelectorAll('button[title="Filter column"]')[1]);
+    fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, {
+      target: { value: "Charl" },
+    });
+
+    const contextMenu = findContextMenuForMode(container, "Charles", "desktop");
+    fireEvent.contextMenu(within(contextMenu).getByText("Charles"));
+    fireEvent.click(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" }));
+
+    await waitFor(() => expect(mockClipboardWriteText).toHaveBeenCalledWith("Charles"));
+  });
+
+  test("offers no cell action for the row-detail column", () => {
+    // That column holds a control, not a value, so there is nothing in it to copy.
+    const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+    fireEvent.click(getByTestId("view-table"));
+    const contextMenu = findContextMenuForMode(container, "Alice", "desktop");
+
+    fireEvent.contextMenu(within(contextMenu).getByText("Alice"));
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Cell" })).not.toBeNull();
+
+    fireEvent.contextMenu(contextMenu.querySelector("[data-row-detail]")!);
+
+    expect(within(contextMenu).queryByRole("menuitem", { name: "Copy Cell" })).toBeNull();
+    expect(within(contextMenu).getByRole("menuitem", { name: "Copy Row as JSON" })).not.toBeNull();
+  });
+
   test("copies the right-clicked mobile-table row as formatted JSON", async () => {
     const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
     fireEvent.click(getByTestId("view-table"));
@@ -574,6 +671,51 @@ describe("ResultsGrid", () => {
     );
   });
 
+  /**
+   * Hiding a column stops the grid emitting it (#870).
+   *
+   * `columnVisibilityFeature` was registered here with no writer, so the assertion that
+   * matters is not that a menu exists but that the table state it writes reaches
+   * `row.getVisibleCells()`. The header AND a cell value are both asserted: a column
+   * dropped from the header while its cells still render would misalign every row.
+   */
+  test("stops rendering a column the stats strip hid", () => {
+    const { getByTestId, queryAllByText } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    expect(queryAllByText("name").length).toBeGreaterThan(0);
+    expect(queryAllByText("Alice").length).toBeGreaterThan(0);
+
+    fireEvent.click(getByTestId("toggle-column"));
+
+    expect(queryAllByText("name").length).toBe(0);
+    expect(queryAllByText("Alice").length).toBe(0);
+    expect(getByTestId("toggle-column").getAttribute("data-hidden")).toBe("name");
+    // The control: a column nobody hid is untouched.
+    expect(queryAllByText("email").length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The card view hides it too (#870).
+   *
+   * Cards are what this grid renders on a phone and what a desktop reader can switch to,
+   * and they take their preview fields from the list they are handed. Handed
+   * `result.fields` they show a column the reader hid a moment earlier in the table, which
+   * is the same split the mobile table had: one hidden column, two answers on one result
+   * depending on which view is open.
+   */
+  test("stops handing a hidden column to the card view", () => {
+    const { getByTestId, getAllByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+
+    expect(getAllByTestId("result-card")[0]!.getAttribute("data-fields")).toContain("name");
+
+    fireEvent.click(getByTestId("toggle-column"));
+
+    const fields = getAllByTestId("result-card")[0]!.getAttribute("data-fields")!;
+    expect(fields.split(",")).not.toContain("name");
+    // The control: the columns nobody hid are still handed over.
+    expect(fields.split(",")).toContain("email");
+  });
+
   // ── 4. Shows row count via StatsBar ───────────────────────────────────────
 
   test("shows row count in stats bar", () => {
@@ -602,12 +744,48 @@ describe("ResultsGrid", () => {
       React.createElement(ResultsGrid, {
         result: mockPaginatedResult,
         onLoadMore,
+        supportsResultPagination: true,
       }),
     );
 
-    const loadMoreBtn = queryByTestId("load-more-btn");
-    expect(loadMoreBtn).not.toBeNull();
-    expect(loadMoreBtn!.textContent).toContain("Load More");
+    const offer = queryByTestId("page-offer");
+    expect(offer).not.toBeNull();
+    // The offer carries the page size the result reports, not a hardcoded 500: a 50-row
+    // table preview used to promise "Load More (500 rows)" and then fetch 50.
+    expect(offer!.textContent).toBe("offer 50");
+  });
+
+  // ── 6b. An offer adds nothing below the grid ──────────────────────────────
+
+  test("an offer adds no chrome below the grid", () => {
+    /*
+      THE UI RULING'S FIRST CRITERION, measured as a DIFFERENCE rather than as a property
+      of this file's stub.
+
+      Asserting that the offer element sits inside the stats bar cannot fail here: the
+      StatsBar stub above builds it as its own child, so it is a descendant whatever
+      `ResultsGrid` does. What the ruling actually says is that the grid gains no chrome
+      and keeps its height whether or not another page is available, and that is a
+      comparison: the grid's own children must be the same set either way. A `LoadMoreFooter`
+      restored below the table is a new sibling here and fails.
+    */
+    const shape = (root: Element) =>
+      Array.from(root.children).map((child) => `${child.tagName}#${child.getAttribute("data-testid") ?? ""}`);
+
+    const withoutOffer = render(React.createElement(ResultsGrid, { result: mockPaginatedResult }));
+    expect(withoutOffer.queryByTestId("page-offer")).toBeNull();
+    const plain = shape(withoutOffer.container.firstElementChild!);
+    cleanup();
+
+    const withOffer = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+    expect(withOffer.queryByTestId("page-offer")).not.toBeNull();
+    expect(shape(withOffer.container.firstElementChild!)).toEqual(plain);
   });
 
   // ── 7. Load More button fires onLoadMore ──────────────────────────────────
@@ -618,11 +796,12 @@ describe("ResultsGrid", () => {
       React.createElement(ResultsGrid, {
         result: mockPaginatedResult,
         onLoadMore,
+        supportsResultPagination: true,
       }),
     );
 
-    const loadMoreBtn = getByTestId("load-more-btn");
-    fireEvent.click(loadMoreBtn);
+    // The callback reaches the strip intact, not just the decision to show a control.
+    fireEvent.click(getByTestId("page-offer"));
     expect(onLoadMore).toHaveBeenCalledTimes(1);
   });
 
@@ -674,11 +853,169 @@ describe("ResultsGrid", () => {
 
   // ── 11. No Load More when no pagination ───────────────────────────────────
 
-  test("no Load More footer when pagination not present", () => {
+  test("no Load More when the result carries no pagination at all", () => {
     const { queryByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
 
-    const loadMore = queryByTestId("load-more-footer");
-    expect(loadMore).toBeNull();
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  // ── the capability gate and the order notice (#816) ───────────────────────
+
+  /**
+   * The control appears only where page two is REACHABLE.
+   *
+   * `supportsExternalQueryLimiting` is not this flag: Cassandra declares that one true
+   * and throws on any positive offset. The five providers that cannot page declare
+   * `supportsResultPagination: false`, and an ABSENT flag reads the same as false — the
+   * #269 rule, so a host or a stale metadata read cannot open the control by omission.
+   */
+  test.each([
+    ["the provider cannot page", { supportsResultPagination: false }],
+    ["the flag is absent altogether", {}],
+  ])("no Load More when %s, even with hasMore", (_label, capability) => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        ...capability,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  test("hands the in-flight state to the strip that renders the control", () => {
+    // Without this the control keeps its idle label and stays clickable while a page is
+    // already on the wire, and a second click asks for the same offset twice.
+    const { getByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        isLoadingMore: true,
+      }),
+    );
+
+    expect(getByTestId("page-offer").getAttribute("data-loading")).toBe("true");
+  });
+
+  test("no Load More when the result reports no further page", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: { ...mockPaginatedResult, pagination: { ...mockPaginatedResult.pagination!, hasMore: false } },
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  test("no Load More when the surface withholds the callback", () => {
+    // A result hydrated from an agent run comes this way: BottomPanel passes no
+    // `onLoadMore`, because there is no statement here to ask for another page of.
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+  });
+
+  /**
+   * Criterion 7. Without an `ORDER BY` the engine may return pages that overlap or skip,
+   * and Studio does not inject one to prevent it. It states the condition instead — once,
+   * beside the existing AUTO-LIMITED badge, and only where a second page can actually be
+   * asked for. A notice about pages the user cannot reach describes nothing.
+   */
+  test("says order across pages is not guaranteed for an unordered pageable result", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users",
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).not.toBeNull();
+  });
+
+  test("says nothing when the statement orders its own result", () => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users ORDER BY id",
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
+  });
+
+  test("reads the statement under the connection's own dialect", () => {
+    // `#` opens a comment in MySQL and is ordinary text in PostgreSQL (#292), so the
+    // same statement is ordered under one dialect and not the other.
+    const props = {
+      result: mockPaginatedResult,
+      onLoadMore: mock(() => {}),
+      supportsResultPagination: true,
+      resultQuery: "SELECT * FROM users # ORDER BY id",
+    };
+
+    expect(
+      render(React.createElement(ResultsGrid, { ...props, databaseType: "mysql" })).queryByTestId("order-notice"),
+    ).not.toBeNull();
+    cleanup();
+    expect(
+      render(React.createElement(ResultsGrid, { ...props, databaseType: "postgres" })).queryByTestId("order-notice"),
+    ).toBeNull();
+  });
+
+  /**
+   * The gate that #933 got wrong and its own test could not see, because its fixture
+   * always had `hasMore: true`. An auto-limited unordered result that fits in ONE page
+   * printed "order across pages is not guaranteed" with no Load More anywhere and no
+   * second page in existence.
+   */
+  test.each([
+    ["no further page exists", { pagination: { ...mockPaginatedResult.pagination!, hasMore: false } }, {}],
+    ["the provider cannot page", {}, { supportsResultPagination: false }],
+    ["the surface withholds the callback", {}, { onLoadMore: undefined }],
+  ])("says nothing about pages when %s", (_label, resultPatch, propPatch) => {
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: { ...mockPaginatedResult, ...resultPatch },
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+        resultQuery: "SELECT * FROM users",
+        ...propPatch,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
+  });
+
+  test("says nothing when the statement that produced the rows is unknown", () => {
+    // No `resultQuery` means the shell could not name the statement. Claiming its order
+    // either way would be a guess, and the quieter guess is the one that does not
+    // reassure.
+    const { queryByTestId } = render(
+      React.createElement(ResultsGrid, {
+        result: mockPaginatedResult,
+        onLoadMore: mock(() => {}),
+        supportsResultPagination: true,
+      }),
+    );
+
+    expect(queryByTestId("page-offer")).not.toBeNull();
+    expect(queryByTestId("order-notice")).toBeNull();
   });
 
   // ── 12. Empty state message is descriptive ────────────────────────────────
@@ -851,6 +1188,37 @@ describe("ResultsGrid", () => {
   // ═══════════════════════════════════════════════════════════════════════
 
   describe("Column filtering", () => {
+    /**
+     * The filter panel closes on a press outside it (#870).
+     *
+     * It sits over the rows it filters, and until this it was dismissed only by pressing
+     * the same funnel again, which is the gesture the open panel covers. Escape already
+     * closed it from inside the input; a reader who had moved the mouse on had neither.
+     */
+    test("closes the filter panel on a press outside it", () => {
+      const { container, queryAllByPlaceholderText, queryAllByTitle } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+
+      fireEvent.click(queryAllByTitle("Filter column")[0]!);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBeGreaterThan(0);
+
+      fireEvent.mouseDown(container);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBe(0);
+    });
+
+    /** The control: typing into the panel is a press inside it and must not close it. */
+    test("keeps the filter panel open while pressing inside it", () => {
+      const { queryAllByPlaceholderText, queryAllByTitle } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+
+      fireEvent.click(queryAllByTitle("Filter column")[0]!);
+      const input = queryAllByPlaceholderText(/^Filter /)[0]!;
+      fireEvent.mouseDown(input);
+      expect(queryAllByPlaceholderText(/^Filter /).length).toBeGreaterThan(0);
+    });
+
     test("clicking filter button opens filter dropdown with input", () => {
       const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
       fireEvent.click(getByTestId("view-table"));
@@ -1105,6 +1473,58 @@ describe("ResultsGrid", () => {
       expect(findEditInput(container)).toBeUndefined();
     });
 
+    test("a filtered row's edit is addressed to its place in the result, not in the filter", () => {
+      // The table is built over the FILTERED rows, so TanStack's `row.index` is a position
+      // in that array. `useInlineEditing` reads the row's primary key out of
+      // `result.rows[rowIndex]`, so with a filter on, an edit used to be keyed to whatever
+      // row happened to sit at the same position unfiltered — a silent write to the wrong
+      // row, which is #881's harm reached through the grid instead of the tab title.
+      const threeRows: QueryResult = {
+        rows: [
+          { id: 1, name: "Alice" },
+          { id: 2, name: "Bob" },
+          { id: 3, name: "Charlie" },
+        ],
+        fields: ["id", "name"],
+        rowCount: 3,
+        executionTime: 1,
+      };
+      const onCellChange = mock(() => {});
+      const { container } = render(
+        React.createElement(ResultsGrid, {
+          result: threeRows,
+          editingEnabled: true,
+          onCellChange,
+          pendingChanges: [],
+        }),
+      );
+
+      // Filter down to Charlie, who is the only visible row and so sits at filtered index 0.
+      const filterButton = Array.from(container.querySelectorAll("button")).find(
+        (b) =>
+          b.getAttribute("title") === "Filter column" && b.closest(".group\\/header")?.textContent?.includes("name"),
+      );
+      fireEvent.click(filterButton ?? container.querySelectorAll('button[title="Filter column"]')[1]);
+      const filterInput = Array.from(container.querySelectorAll("input")).find((i) =>
+        (i.getAttribute("placeholder") ?? "").startsWith("Filter"),
+      )!;
+      fireEvent.change(filterInput, { target: { value: "Charlie" } });
+
+      const visible = Array.from(container.querySelectorAll(".cursor-text")).filter((c) => c.textContent === "Charlie");
+      expect(visible).toHaveLength(1);
+      fireEvent.doubleClick(visible[0]);
+
+      const editInput = findEditInput(container)!;
+      fireEvent.change(editInput, { target: { value: "Charlize" } });
+      fireEvent.keyDown(findEditInput(container)!, { key: "Enter" });
+
+      expect(onCellChange).toHaveBeenCalledTimes(1);
+      const change = (onCellChange.mock.calls as unknown[][])[0][0] as Record<string, unknown>;
+      expect(change.rowIndex).toBe(2);
+      expect(change.originalValue).toBe("Charlie");
+      expect(change.newValue).toBe("Charlize");
+    });
+
     test("blur commits a desktop-table edit when value changed", () => {
       const onCellChange = mock(() => {});
       const { container, getByTestId } = render(
@@ -1220,6 +1640,29 @@ describe("ResultsGrid", () => {
       // After reveal, the cell should show actual email value (not ***)
       // This confirms the revealed cell branch (lines 328-333) is hit
       expect(container.textContent).toContain("alice@example.com");
+    });
+
+    test("a reveal follows its row through a filter, not the position it sat at", () => {
+      // A revealed cell is keyed by its position, and the table iterates the FILTERED
+      // rows - so revealing Alice's email and then filtering down to Charlie handed
+      // Charlie's row the key Alice's reveal wrote, and a sensitive value nobody asked
+      // for was on screen unmasked. Same addressing defect as the pending-change one
+      // above it, and this half of it crosses the masking boundary.
+      setupMasking();
+
+      const { container } = render(React.createElement(ResultsGrid, maskingProps));
+
+      fireEvent.click(container.querySelectorAll('button[title="Reveal value (10s)"]')[0]);
+      expect(container.textContent).toContain("alice@example.com");
+
+      const filterButtons = container.querySelectorAll('button[title="Filter column"]');
+      fireEvent.click(filterButtons[1]);
+      fireEvent.change(container.querySelector('input[placeholder="Filter name..."]')!, {
+        target: { value: "Charlie" },
+      });
+
+      expect(container.textContent).not.toContain("charlie@example.com");
+      expect(container.textContent).toContain("***");
     });
 
     test("desktop-table revealed cell auto-hides after timeout", () => {
@@ -1381,8 +1824,9 @@ describe("ResultsGrid", () => {
       fireEvent.click(getByTestId("view-table"));
 
       expect(getAllByRole("button", { name: "name" })[0].textContent).toBe("name");
-      // No header gains a tooltip it did not have before ("Filter column" is pre-existing).
-      expect(container.querySelectorAll('[title]:not([title="Filter column"])').length).toBe(0);
+      // No header gains a tooltip it did not have before ("Filter column" is pre-existing,
+      // and the row detail control is a row control rather than a header).
+      expect(container.querySelectorAll('[title]:not([title="Filter column"]):not([data-row-detail])').length).toBe(0);
     });
   });
 
@@ -1433,11 +1877,13 @@ describe("ResultsGrid", () => {
     const { getAllByRole, getByTestId, container } = render(React.createElement(ResultsGrid, { result: mockResult }));
     fireEvent.click(getByTestId("view-table"));
 
-    // `:not([data-testid])` excludes the mocked ResultCard above, which also
-    // carries data-index; only the desktop table's rows come off the table
-    // instance, and they are the ones the row model orders.
+    // `:not([data-testid])` excludes the mocked ResultCard above and `:not(button)`
+    // the mobile table's rows, which both carry data-index too; only the desktop
+    // table's rows come off the table instance, and they are the ones the row model orders.
     const renderedRows = () =>
-      Array.from(container.querySelectorAll("[data-index]:not([data-testid])")).map((row) => row.textContent ?? "");
+      Array.from(container.querySelectorAll("[data-index]:not([data-testid]):not(button)")).map(
+        (row) => row.textContent ?? "",
+      );
 
     expect(renderedRows()).toHaveLength(3);
     expect(renderedRows()[0]).toContain("Alice");
@@ -1491,6 +1937,207 @@ describe("ResultsGrid", () => {
       for (const handle of handles) {
         expect(handle.getAttribute("aria-hidden")).toBe("true");
       }
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Text Wrapping Tests
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Text wrapping", () => {
+    // Walks from every element showing `text` up to its virtual row (desktop and
+    // mobile both render in the DOM), collecting what could hold the value to one line.
+    function lineConstraints(container: HTMLElement, text: string) {
+      const found = Array.from(container.querySelectorAll("span")).filter((el) => el.textContent === text);
+      expect(found.length).toBeGreaterThan(0);
+      return found.map((el) => {
+        const classes: string[] = [];
+        let node: HTMLElement | null = el;
+        while (node && !node.style.transform) {
+          classes.push(...Array.from(node.classList));
+          node = node.parentElement;
+        }
+        expect(node).not.toBeNull();
+        // measureElement files a row's height under this attribute; a row without it
+        // grows on screen while the rows below it stay where the old height put them.
+        expect(node!.dataset.index).toBeDefined();
+        return { classes, rowHeight: node!.style.height, mobile: node!.tagName === "BUTTON" };
+      });
+    }
+
+    function expectSingleLine(container: HTMLElement, text: string) {
+      for (const { classes, rowHeight, mobile } of lineConstraints(container, text)) {
+        expect(classes).toContain("whitespace-nowrap");
+        // The desktop grid's ellipsis is part of the unchanged behaviour; the mobile table never had one.
+        if (!mobile) expect(classes).toContain("truncate");
+        expect(rowHeight).toBe("36px");
+      }
+    }
+
+    function expectWrapped(container: HTMLElement, text: string) {
+      for (const { classes, rowHeight } of lineConstraints(container, text)) {
+        expect(classes).not.toContain("truncate");
+        expect(classes).not.toContain("whitespace-nowrap");
+        expect(classes).not.toContain("h-full");
+        expect(rowHeight).toBe("");
+      }
+    }
+
+    test("a plain cell wraps and its row sheds the fixed height, and turning it off restores both", () => {
+      const { container, getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      expectSingleLine(container, "alice@example.com");
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "alice@example.com");
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectSingleLine(container, "alice@example.com");
+    });
+
+    test("every toggle drops the measured row heights, so turning wrap off shrinks rows back", () => {
+      // The virtualizer caches each measured row; without a reset, rows grown while
+      // wrapping keep that height after the toggle is off again.
+      const { getByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      mockVirtualizerMeasure.mockClear();
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expect(mockVirtualizerMeasure).toHaveBeenCalledTimes(2);
+
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expect(mockVirtualizerMeasure).toHaveBeenCalledTimes(4);
+    });
+
+    test("an editable cell wraps too", () => {
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: mockResult,
+          editingEnabled: true,
+          onCellChange: mock(() => {}),
+          pendingChanges: [],
+        }),
+      );
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "alice@example.com");
+    });
+
+    test("masked and revealed cells wrap too", () => {
+      mockShouldMask.mockReturnValue(true);
+      mockCanReveal.mockReturnValue(true);
+      mockDetectSensitiveColumnsFromConfig.mockReturnValue(
+        new Map([
+          ["email", { name: "email", maskType: "email" as const, columnPatterns: ["email"], enabled: true, id: "e1" }],
+        ]),
+      );
+      const { container, getByTestId } = render(
+        React.createElement(ResultsGrid, {
+          result: mockResult,
+          maskingEnabled: true,
+          maskingConfig: {
+            enabled: true,
+            patterns: [],
+            roleSettings: { admin: { canToggle: true, canReveal: true }, user: { canToggle: false, canReveal: false } },
+          },
+        }),
+      );
+      fireEvent.click(getByTestId("wrap-toggle"));
+      expectWrapped(container, "***");
+
+      fireEvent.click(container.querySelector('button[title="Reveal value (10s)"]')!);
+      expectWrapped(container, "alice@example.com");
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Row detail on the desktop grid (#800)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  describe("Row detail on the desktop grid", () => {
+    // The desktop table is the only place that renders through TanStack columns, so a
+    // control that came from the column list is on the desktop row and nowhere else.
+    function detailControls(container: HTMLElement): HTMLButtonElement[] {
+      return Array.from(container.querySelectorAll<HTMLButtonElement>("button[data-row-detail]"));
+    }
+
+    test("every desktop row carries a control that opens the row detail sheet", () => {
+      const { container, queryByTestId } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const controls = detailControls(container);
+      expect(controls.length).toBe(mockResult.rows.length);
+
+      expect(queryByTestId("row-detail-sheet")).toBeNull();
+      fireEvent.click(controls[1]);
+      expect(queryByTestId("row-detail-sheet")).not.toBeNull();
+      expect(queryByTestId("row-detail-sheet")!.getAttribute("data-row-index")).toBe("1");
+    });
+
+    test("the control names the row it opens, so its accessible name is not bare", () => {
+      const { getByRole } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      expect(getByRole("button", { name: "Show row 3 field by field" })).not.toBeNull();
+    });
+
+    test("the control opens the row the reader sees after sorting, not the unsorted one", () => {
+      const { container, getAllByRole, queryByTestId } = render(
+        React.createElement(ResultsGrid, { result: mockResult }),
+      );
+      // Descending on `name` puts Charlie first, so the first control must open row 2.
+      fireEvent.click(getAllByRole("button", { name: "name" })[0]);
+      fireEvent.click(getAllByRole("button", { name: "name, sorted ascending" })[0]);
+      fireEvent.click(detailControls(container)[0]);
+      expect(queryByTestId("row-detail-sheet")!.getAttribute("data-row-index")).toBe("2");
+    });
+
+    /**
+     * The reason this issue existed at all: the vertical view shipped behind `md:hidden`,
+     * so it was absent on exactly the screens that meet a wide table (#800). A breakpoint
+     * class on the control or on the cell holding it would put it back there, and a
+     * narrowed desktop window or a tablet would lose it in silence.
+     */
+    test("no breakpoint hides the control or the cell holding it", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      // Without this the loop below asserts nothing when no control was rendered at all.
+      expect(detailControls(container).length).toBeGreaterThan(0);
+      for (const control of detailControls(container)) {
+        for (let el: HTMLElement | null = control; el !== null; el = el.parentElement) {
+          // The desktop grid's own `hidden md:block` is the boundary, not a finding: below
+          // that width the card and mobile table render, and both already open the sheet.
+          if (el.hasAttribute("data-desktop-grid")) break;
+          const classes = (el.getAttribute("class") ?? "").split(/\s+/);
+          expect(classes.filter((c) => /^(sm|md|lg|xl|2xl):/.test(c) || c === "hidden")).toEqual([]);
+        }
+      }
+    });
+
+    test("the control column cannot be resized, so it keeps its width", () => {
+      const { container } = render(React.createElement(ResultsGrid, { result: mockResult }));
+      const headers = Array.from(container.querySelectorAll("[data-row-detail-header]"));
+      expect(headers.length).toBe(1);
+      expect(headers[0].querySelector(".cursor-col-resize")).toBeNull();
+      // The field columns keep theirs: the guard is per column, not a removal.
+      expect(container.querySelectorAll(".cursor-col-resize").length).toBe(mockResult.fields.length);
+    });
+
+    /**
+     * `SELECT 1 AS "__libredb_row_detail__"` is legal, and a result set carrying that
+     * column name must still render both it and the control, not one column swallowing
+     * the other.
+     */
+    test("a field named like the control column still gets its own column", () => {
+      const collidingResult: QueryResult = {
+        rows: [{ __libredb_row_detail__: "value", id: 1 }],
+        fields: ["__libredb_row_detail__", "id"],
+        rowCount: 1,
+        executionTime: 1,
+      };
+      const { container, getAllByRole } = render(React.createElement(ResultsGrid, { result: collidingResult }));
+      expect(detailControls(container).length).toBe(1);
+      expect(getAllByRole("button", { name: "__libredb_row_detail__" }).length).toBeGreaterThan(0);
+
+      // Two columns under one id is what breaks: the grid keys header and body cells by
+      // the column id, and every cell answering to it is then styled as the control -
+      // the field's own value would be pinned to the left edge in the control's place.
+      const desktop = container.querySelector("[data-desktop-grid]")!;
+      const valueCell = Array.from(desktop.querySelectorAll("span")).find((el) => el.textContent === "value");
+      expect(valueCell).toBeDefined();
+      expect(valueCell!.closest("[style*='width']")!.getAttribute("class")).not.toContain("sticky");
     });
   });
 });

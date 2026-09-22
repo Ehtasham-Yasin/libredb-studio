@@ -1,3 +1,22 @@
+/*
+  This module type-imports from `src/lib/db`, which is the opposite of the usual direction,
+  and it is deliberate (#789).
+
+  `SchemaSnapshot.schema` stores what the consumer actually held, and that shape is
+  `StoredObject`, which is `DetailedObject` with the two fields a record written before the
+  object model could not carry. The alternative is a second declaration of the same shape
+  here, which is precisely the drift the field's own docblock records: the declaration said
+  `TableSchema` while the stored JSON carried two more fields, and a later reader trusted the
+  type instead of the data. One declaration, imported, cannot drift.
+
+  It is TYPE-ONLY in both directions and there is no runtime edge: `detailed-object.ts` imports
+  `ColumnSchema`, `ForeignKeySchema` and `IndexSchema` from this file, so the two are a type
+  cycle that TypeScript resolves and every bundler erases. Nothing is imported for a value, so
+  no module graph is created by it.
+*/
+import type { StoredObject } from "@/lib/db/detailed-object";
+import type { ObjectSourceDocument } from "@/lib/db/types";
+
 export type DatabaseType =
   | "postgres"
   | "mysql"
@@ -141,6 +160,60 @@ export interface SSHTunnelConfig {
   hostKeyFingerprint?: string;
 }
 
+/**
+ * Where an SSH tunnel's local endpoint actually forwards to: the address the record named
+ * before `src/lib/db/factory.ts` rewrote `host` and `port` (X23).
+ *
+ * SYMBOL-KEYED ON PURPOSE, and that is the whole of its access control. A plan's seal is
+ * `connectionFingerprint(provider.config)` and this value decides it, so it must not be
+ * settable by whoever stores or posts a connection. Every connection this app resolves has
+ * come through `JSON.parse` - out of `localStorage`, out of the storage provider, off a
+ * request body - and `JSON.parse` can produce no symbol key at all, while `JSON.stringify`
+ * drops one on the way back. So the only writer is server code holding this exported symbol,
+ * which is the footing `ProviderExecutionContext` was given for the same reason: a value the
+ * seal depends on cannot live somewhere a caller fills in.
+ *
+ * It is NOT the bastion. `SSHTunnelConfig` is still framed separately by `tunnelRoute`, so the
+ * same `db:5432` reached through two different machines stays two different digests - and what
+ * makes that the machine the bytes traverse rather than only the one the record names is the
+ * tunnel pool, which keys a forward on that same `tunnelRoute` string (D86). Framed here and
+ * shared there, a record can only be handed a forward through the bastion it names.
+ */
+export const TUNNEL_FAR_END: unique symbol = Symbol("libredb.tunnelFarEnd");
+
+/**
+ * The far side of an SSH forward AS THE FORWARD REACHES IT: the `remoteHost` and `remotePort`
+ * the factory reads back off `TunnelInfo`, which is the address `forwardOut` dials for every
+ * socket the tunnel accepts.
+ *
+ * It is deliberately not the address the factory ASKED for. The two could differ while
+ * `createSSHTunnel` pooled by connection id alone, and a provider on a reused tunnel then
+ * sealed a machine its statements never reached (D86). The pool keys on the far end and the
+ * bastion route now, and the measurement that closed it is on `tunnelledConnection` in
+ * `src/lib/db/factory.ts`.
+ */
+export interface TunnelFarEnd {
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * Carries {@link TUNNEL_FAR_END} alongside a connection, and is deliberately NOT a field on
+ * `DatabaseConnection` itself.
+ *
+ * `keyof DatabaseConnection` is a WRITE LIST with three exhaustive readers -
+ * `FIELD_OWNERSHIP` in `src/hooks/use-connection-form.ts`, `CONNECTION_RELEVANCE` in
+ * `src/hooks/use-connection-payload.ts` and `CONNECTION_FIELDS` in
+ * `src/lib/storage/connection-secrets.ts` - and each of them answers a question about what a
+ * USER may fill in, send and have stored. This value is none of those things, so adding it
+ * there would have made all three classify something they never see. Intersecting instead keeps
+ * the optional property assignable in both directions: a plain `DatabaseConnection` satisfies
+ * it, and a carrier is still a `DatabaseConnection` everywhere one is asked for.
+ */
+export interface WithTunnelFarEnd {
+  readonly [TUNNEL_FAR_END]?: TunnelFarEnd;
+}
+
 export interface DatabaseConnection {
   id: string;
   name: string;
@@ -186,19 +259,39 @@ export interface DatabaseConnection {
    * is a field of its own rather than a reuse of `database`.
    */
   authSource?: string;
+  /**
+   * Read no catalog when this connection opens.
+   *
+   * For a connection whose owner holds tens of thousands of objects, even the two cheap
+   * reads first paint makes are worth deferring, and a user who only wants to run one
+   * statement should not wait for either (#765, asked for by the reporter as "not
+   * preloading anything ... at db connection level"). The editor and query execution
+   * are fully usable while this is set; the object panel shows a load action instead of
+   * a scan, and pressing it reads exactly what opening the connection would have.
+   *
+   * A per-connection answer rather than a global setting, because the connection is
+   * what knows: the same deployment holds a five-table SQLite sample and a 40,000-object
+   * Oracle owner, and the flag follows the one that hurts.
+   */
+  skipObjectScan?: boolean;
   managed?: boolean; // true = admin-controlled, read-only in UI
   seedId?: string; // stable reference to seed config ID
   agentUser?: string; // optional least-privilege role for the agent read-only execution profile (#328)
   agentPassword?: string; // password for agentUser; secret-classified, sealed at rest by connection-secrets
-}
-
-export interface TableSchema {
-  name: string;
-  columns: ColumnSchema[];
-  indexes: IndexSchema[];
-  foreignKeys?: ForeignKeySchema[];
-  rowCount?: number;
-  size?: string;
+  /**
+   * Elasticsearch only (#708): an API key pair, sent as `Authorization: ApiKey
+   * base64(apiKeyId:apiKeySecret)` in preference to `user`/`password` when both halves
+   * are set (each half trimmed first). Half a pair (one field with no other) is not a
+   * shorter key, so it falls back to `user`/`password` rather than sending a key built
+   * from an empty secret. OpenSearch refuses the pair: nothing has measured whether
+   * its security plugin accepts the same scheme.
+   *
+   * `apiKeyId` is classified `secret` in connection-secrets.ts, not `public` the way
+   * `user` is: unlike a name an operator chose, it is one generated, opaque half of a
+   * credential pair, and leaving it readable narrows what a leak has to guess.
+   */
+  apiKeyId?: string;
+  apiKeySecret?: string;
 }
 
 export interface ForeignKeySchema {
@@ -207,24 +300,76 @@ export interface ForeignKeySchema {
   referencedColumn: string;
 }
 
-/**
- * Heavy relationship/index data for a table, loaded separately from the fast
- * structural schema (see getSchemaList / getSchemaRelations) and merged on the
- * client by `name`. Keeping it separate prevents a slow stats query from
- * blocking the table list.
- */
-export interface TableRelations {
-  name: string;
-  foreignKeys: ForeignKeySchema[];
-  indexes: IndexSchema[];
-}
-
 export interface ColumnSchema {
   name: string;
   type: string;
+  /**
+   * The type this column's declared type is BUILT ON, where the engine distinguishes the
+   * two, and absent where it does not.
+   *
+   * SQL Server alias types are why it exists. `Person.PersonPhone.PhoneNumber` is declared
+   * `Phone`, which is an alias over `nvarchar`, and `Person.Person.FirstName` is `Name` over
+   * the same: the alias is what a person wants to SEE, and it is what `type` carries and
+   * what the object browser renders. It is not what a reader can DECIDE on. Anything that
+   * matches a declared type against a spelling it knows - which columns get a text shape
+   * test, which cannot be counted, which have no equality operator - is matching a name the
+   * schema's author invented, and it silently matches nothing.
+   *
+   * So a provider that can tell the two apart reports both, and a reader that is deciding
+   * rather than displaying prefers this one. Optional because most engines have no such
+   * distinction, and there an absent field is the honest answer rather than a copy of
+   * `type` that would claim a provider had looked.
+   */
+  baseType?: string;
   nullable: boolean;
   isPrimary: boolean;
+  /**
+   * What the column defaults to, as the provider reads it, and NOT one single kind of string
+   * across the fleet.
+   *
+   * On most providers it is the engine's own catalog TEXT, copied out unchanged: PostgreSQL
+   * reports `nextval('app.orders_id_seq'::regclass)` here, SQL Server `((0))`. On MySQL and
+   * MariaDB it is the DECODED value, `abc` rather than `'abc'`, because MariaDB reports the
+   * default as the expression its author wrote and showing that to a reader showed a default
+   * nobody wrote (#795). SQLite, libSQL and DuckDB report it the same way MariaDB does and
+   * decode it the same way (#1029).
+   *
+   * ClickHouse is neither. `readDefault` in `clickhouse/introspect.ts` answers the bare
+   * expression for kind `DEFAULT` and CONSTRUCTS `MATERIALIZED a + b` for the other kinds,
+   * so the field there names its own clause and is not pasteable after the word DEFAULT.
+   * The migration generator has `clickhouseDefaultKind` for exactly that, and the half of it
+   * that was never applied is issue #1032.
+   *
+   * Decoding is why {@link defaultExpression} exists: once a provider decodes, this field is
+   * no longer something a reader can paste after the word DEFAULT, so the provider that
+   * decoded carries the text alongside it.
+   */
   defaultValue?: string;
+  /**
+   * The SQL TEXT that produces {@link defaultValue}, as the engine's own catalog spells it,
+   * carried by a provider that DECODED the value out of it.
+   *
+   * It exists for the same reason `baseType` does: a reader that is DECIDING needs a
+   * different field from a reader that is DISPLAYING. Where both are set, `defaultValue` is
+   * the VALUE the column defaults to, which is what the object browser shows; this is what
+   * goes after the word DEFAULT, and a reader EMITTING SQL must prefer it. The two are
+   * genuinely different strings: MariaDB's `DEFAULT 'abc'` has the value `abc` and the
+   * expression `'abc'`, and `CREATE TABLE t (note varchar(20) DEFAULT abc)` is ERROR 1054 on
+   * that server while `DEFAULT 'abc'` is accepted (measured on 12.3.2).
+   *
+   * A provider sets it where it DECODED {@link defaultValue} out of the catalog text. Absence
+   * is therefore not negligence and not "there is no expression": on the providers that copy
+   * the catalog out unchanged it says `defaultValue` already IS the text, and a reader
+   * emitting SQL should use that.
+   *
+   * Two engines are absent for their own reasons rather than that one. MySQL reports the
+   * evaluated value with an EXTRA that cannot say whether the text is SQL - `abc` is a value,
+   * `b'1'` and `0x616263` are SQL, all three carry an empty EXTRA - so it declares nothing
+   * here rather than inventing a quoting rule, and what that costs is issue #1031. ClickHouse
+   * builds a clause-naming string rather than a value, which is a third case this field does
+   * not model; see {@link defaultValue} and issue #1032.
+   */
+  defaultExpression?: string;
 }
 
 export interface IndexSchema {
@@ -331,11 +476,70 @@ export interface QueryResult {
   columnTypes?: Record<string, string>;
 }
 
+/**
+ * A Source tab's whole state: an ADDRESS, what has been read against it, and which part is
+ * shown (#789 Phase 2).
+ *
+ * No connection id, deliberately. Tabs are already scoped per connection by the persistence
+ * key `libredb_workspace_tabs_v1:${connection.id}`, and the shell renders the active
+ * connection beside the active tab, so an id here would be a third copy of a fact two places
+ * already hold and the three could disagree.
+ *
+ * The ADDRESS is the only half that is persisted, and `PersistedTabState` in
+ * `src/hooks/use-tab-manager.ts` is where that is enforced and argued. A restored Source tab
+ * therefore carries `path` and `kind` alone and RE-READS, which is also why every other field
+ * here is optional: absent is the state a freshly opened and a freshly restored tab share, and
+ * it is what tells the viewer to issue a read.
+ */
+export interface SourceTabState {
+  readonly path: readonly string[];
+  readonly kind: string;
+  /** Absent while loading and after a failed read. Never persisted: see `PersistedTabState`. */
+  readonly document?: ObjectSourceDocument;
+  /** The route's own sentence. */
+  readonly failure?: string;
+  readonly activePartId?: string;
+  /** The catalog-change counter's value when this document was read. */
+  readonly readAtToken?: number;
+  /**
+   * WHICH part the reader is editing, and never a boolean (#789 Phase 3, discussion #778).
+   *
+   * Per part and not per tab, so two parts of one Oracle package can hold two independent drafts,
+   * the writable buffer can only ever be the part on screen, and a part switch is what leaves edit
+   * mode. A boolean would have to be read together with `activePartId` at every site, and the pair
+   * can disagree.
+   *
+   * NOT PERSISTED, like every other field here but the address. The unsaved text itself lives in
+   * its own bounded store keyed by address and part, so a restored tab re-reads and then offers
+   * the draft back rather than reopening in a writable state nothing has re-checked.
+   */
+  readonly editingPartId?: string;
+  /**
+   * Whether the buffer differs from the text the engine answered. Not persisted either.
+   *
+   * The tab bar is the reader of it, and the pane writes it ONLY when the boolean flips, so it
+   * costs one render per transition rather than one per keystroke.
+   */
+  readonly dirty?: boolean;
+}
+
 export interface QueryTab {
   id: string;
   name: string;
   query: string;
   result: QueryResult | null;
+  /**
+   * The statement that produced `result`, as it was actually sent.
+   *
+   * Not the same thing as `query`, which is the EDITOR BUFFER and is rewritten on every
+   * keystroke — and not always a prefix of it either, since a run takes the editor's
+   * effective query, which may be a selection or the statement under the cursor. Inline
+   * editing writes back to the table the displayed rows came from, so it has to read the
+   * statement that fetched them rather than whatever is in the buffer now (#881).
+   *
+   * Absent on a tab whose result predates this field, and on one that has never run.
+   */
+  resultQuery?: string;
   isExecuting: boolean;
   type: "sql" | "mongodb" | "redis" | "libredb";
   viewMode?: "results" | "explain" | "history" | "saved";
@@ -344,6 +548,22 @@ export interface QueryTab {
   currentOffset?: number;
   isLoadingMore?: boolean;
   allRows?: Record<string, unknown>[];
+  /**
+   * Present exactly on a Source tab (#789 Phase 2).
+   *
+   * An optional FIELD and deliberately not a fifth member of `type`. Every member of that
+   * union is a QUERY DIALECT that `resolveTabType` may answer and that
+   * `editorLanguageForTabType` maps onto `QueryEditor`'s closed language union, so a
+   * `"source"` member would be an arm the resolver can never produce and the language mapper
+   * would have to answer for, and it would put the per-object language decision back into the
+   * two functions `CLAUDE.md` keeps it out of. The definition's own Monaco language travels on
+   * the PART instead, which is where the provider put it.
+   *
+   * A Source tab therefore still carries a `type`, and it is the neutral default: nothing
+   * reads it, because both surfaces that would branch on it, the tab bar's icon and the editor
+   * pane, branch on the presence of this field first.
+   */
+  source?: SourceTabState;
 }
 
 export interface QueryHistoryItem {
@@ -375,7 +595,23 @@ export interface SchemaSnapshot {
   connectionId: string;
   connectionName: string;
   databaseType: DatabaseType;
-  schema: TableSchema[];
+  /**
+   * The objects as the consumer held them when the snapshot was taken (#789).
+   *
+   * `StoredObject` and NOT `DetailedObject`, and the difference is the whole compatibility
+   * story of this record. A live reading now always carries `kind` and `path`, because the
+   * flat surface it used to come from is gone, so `DetailedObject` declares both as facts.
+   * A snapshot is not a live reading: these records sit in the user's own storage, and every
+   * one written before the object model landed carries neither field. Declaring the stored
+   * array as the live shape would be the same drift this field has already had once, where
+   * the declaration said `TableSchema` and the stored JSON carried two more fields.
+   *
+   * `diffSchemas` therefore keeps comparing BY NAME, as Task 25c measured: an old snapshot
+   * carries no kind, so keying on kind would report every object in it as removed and
+   * re-added the first time it was opened against a current reading. Nothing migrates these
+   * records and nothing needs to.
+   */
+  schema: StoredObject[];
   createdAt: Date;
   label?: string;
 }

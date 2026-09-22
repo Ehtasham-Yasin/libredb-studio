@@ -13,12 +13,15 @@
   <a href="README_zh.md">简体中文</a> ·
   <a href="README_ja.md">日本語</a> ·
   <a href="README_es.md">Español</a> ·
-  <b>اردو</b>
+  <b>اردو</b> ·
+  <a href="README_hi.md">हिन्दी</a>
 </p>
 
 <p align="center" dir="rtl">
   PostgreSQL project میں درج شدہ:
   <a href="https://www.postgresql.org/about/news/libredb-studio-an-open-source-self-hosted-sql-ide-for-postgresql-in-the-browser-3368/">News</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/PostgreSQL_Clients#LibreDB_Studio">PostgreSQL Clients</a>
   ·
   <a href="https://www.postgresql.org/download/products/1/">Software Catalogue</a>
   ·
@@ -29,9 +32,12 @@
   <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>،
   <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>،
   <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>،
-  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>
+  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>،
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>،
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>،
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>
   اور
-  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>
+  <a href="https://opensearch.org/community-projects/">OpenSearch</a>
   کی سرکاری دستاویزات میں بھی درج ہے
 </p>
 
@@ -45,6 +51,8 @@
   <a href="https://codecov.io/github/libredb/libredb-studio"><img src="https://codecov.io/github/libredb/libredb-studio/graph/badge.svg?token=VA6CO9R7IH" alt="Coverage"></a>
   <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio" alt="Artifact Hub"></a>
 </p>
+
+> <span dir="rtl">یہ اردو README کمیونٹی کا ترجمہ ہے اور انگریزی نسخے سے پیچھے ہو سکتا ہے۔ فرق کی صورت میں [انگریزی نسخہ](README.md) معتبر ہے۔</span>
 
 <div dir="rtl" align="right">
 
@@ -244,7 +252,7 @@ npm i @libredb/studio
 ## <span dir="rtl">Tests اور quality</span>
 
 <ul dir="rtl" align="right">
-<li><span dir="rtl">Tests کی چھ layers: unit، API، integration، hooks، components اور end-to-end</span></li>
+<li><span dir="rtl">Tests کی سات layers: unit، API، integration، hooks، security، evals اور components، اس کے علاوہ end-to-end</span></li>
 <li><span dir="rtl"><strong>100% line coverage</strong>، اور CI میں یہ سخت شرط ہے۔ coverage کم ہوئی تو merge رک جاتا ہے</span></li>
 <li><span dir="rtl">SonarCloud quality gate</span></li>
 <li><span dir="rtl">ہر release میں Node 24 اور 26 پر smoke tests</span></li>

@@ -478,6 +478,11 @@ const FAILURE_SENTENCES = {
   // not at fault: this refusal reaches PostgreSQL and SQLite too (B47).
   "agent-credential-unusable":
     "This connection's agent credential cannot be used: check that both the agent user and password are set, that the password still decrypts under the current secret key, and that no connection string is set beside it.",
+  // Names the database user, because the engine is supported and the credential was
+  // applied: the profile refused the principal it opened as. Folded into the engine
+  // sentence, an operator connected as `sa` was told to change engines.
+  "agent-principal-refused":
+    "The database user this run would execute as was refused by the read-only execution profile, not by the engine: it holds privileges the boundary cannot contain, or it cannot ask for the plan that admits a statement. Point the connection's agent credential at a least-privilege user.",
   "connection-unresolvable": "This run's database connection no longer resolves on the server.",
   internal: "The server could not carry this run. The reason is in the server log.",
 } as const satisfies Record<AgentRunFailureReason, string>;
@@ -600,8 +605,15 @@ function guardSentence(
  * takes "everything it names exists" for "this will run".
  *
  * The objects are named in the engine's own word (#414) and not in this product's
- * storage shape: the check reads the same inventory the prompt was written from, and
- * on Druid that inventory's rows are datasources however `TableSchema` spells them.
+ * storage shape: the check reads the same inventory the prompt was written from, and on
+ * Druid that inventory's rows are datasources whatever the shape recording them is called.
+ *
+ * WHAT IT CHECKED NARROWED with the object model (#789), and the sentences below are worded
+ * the way they are because of it. The inventory a run reads carries the schema's views,
+ * sequences and functions beside its tables, and `validatePlanStatement` answers only for
+ * the kinds whose declared role says a statement can name one - so a name reported here may
+ * be an object the run WAS shown, under a kind nothing can be selected from. The claim the
+ * sentence makes is still exactly true: the statement may not run as written.
  *
  * `not-applicable` is the third branch and, like the guard's, it is about the CHECK
  * and not about the draft (#414). It is deliberately not worded as `no-inventory` is:

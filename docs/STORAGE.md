@@ -55,6 +55,10 @@ LibreDB Studio supports three storage modes. Pick the one that fits your use cas
 | **SQLite** | Small teams, single server | Server file | Yes | 1 env var |
 | **PostgreSQL** | Enterprise, multi-node | External DB | Yes | 2 env vars |
 
+Server storage (`sqlite` or `postgres`) gives each person their own private workspace by partitioning connections, saved queries, and settings by the login username.
+For a team of three or more, pair server storage with Single Sign-On via [OIDC](OIDC.md) to provide individual logins, personal workspaces, and an audit trail that attributes actions to each user.
+The default `local` mode stores data in the browser and does not isolate workspaces between people using the same browser profile.
+
 ---
 
 ## 1. Local Mode (Default)
@@ -252,7 +256,10 @@ services:
       - POSTGRES_USER=libredb
       - POSTGRES_PASSWORD=secret
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18+ images expect the mount at /var/lib/postgresql, not /var/lib/postgresql/data.
+      # A pgdata volume from the old layout has to be removed once: run docker compose down, then
+      # docker volume rm on the volume whose name ends in _pgdata (find it with docker volume ls).
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U libredb"]
       interval: 5s
@@ -580,7 +587,7 @@ CREATE INDEX IF NOT EXISTS idx_user_storage_user_id ON user_storage (user_id);
 | Column | Type | Description |
 |--------|------|-------------|
 | `user_id` | TEXT | User's email from JWT token (e.g., `admin@libredb.org`) |
-| `collection` | TEXT | Data category: `connections`, `history`, `saved_queries`, `schema_snapshots`, `saved_charts`, `active_connection_id`, `audit_log`, `masking_config`, `threshold_config`, `dismissed_seeds` |
+| `collection` | TEXT | Data category: `connections`, `history`, `saved_queries`, `schema_snapshots`, `saved_charts`, `active_connection_id`, `audit_log`, `masking_config`, `threshold_config`, `dismissed_seeds`, `favorite_connections`, `connection_order` |
 | `data` | TEXT | JSON-serialized collection data |
 | `updated_at` | TEXT / TIMESTAMPTZ | Last modification timestamp |
 
@@ -647,7 +654,7 @@ This part describes the internals of the storage abstraction layer: design goals
 
 ### 3.1 Collections
 
-All application state is organized into **10 collections**, each stored as a JSON blob:
+All application state is organized into **12 collections**, each stored as a JSON blob:
 
 | Collection | Type | Description | Max Items |
 |-----------|------|-------------|-----------|
@@ -661,6 +668,17 @@ All application state is organized into **10 collections**, each stored as a JSO
 | `masking_config` | `MaskingConfig` | Data masking rules and RBAC | — |
 | `threshold_config` | `ThresholdConfig[]` | Monitoring alert thresholds | — |
 | `dismissed_seeds` | `string[]` | Seed IDs the user dismissed (deleted a `managed: false` seed copy) so it is not re-added | — |
+| `favorite_connections` | `string[]` | Connection ids the user has starred | — |
+| `connection_order` | `string[]` | Connection ids in the user's custom drag order | — |
+
+**A snapshot taken before the object model has no kind and no path.** `schema_snapshots` holds what
+the schema list held when the snapshot was taken, and a live reading now always carries an object's
+kind and its full address; a record written by an older version carries the name and the columns
+only. Those records are kept and stay comparable rather than being migrated or discarded, so the
+diff matches an old snapshot to a new reading BY NAME, and a diff against one cannot tell a view
+from a table or two same-named objects in different schemas apart. Take a fresh snapshot to get a
+baseline that carries both. Nothing is lost either way: a stored snapshot is the user's own data and
+this product does not rewrite it in place.
 
 ### 3.2 Server Database Schema
 
@@ -698,6 +716,8 @@ audit_log         → libredb_audit_log
 masking_config    → libredb_masking_config
 threshold_config  → libredb_threshold_config
 dismissed_seeds   → libredb_dismissed_seeds
+favorite_connections → libredb_favorite_connections
+connection_order  → libredb_connection_order
 ```
 
 ---
@@ -770,7 +790,7 @@ storage.saveConnection(conn);
 
 | Category | Methods |
 |----------|---------|
-| **Connections** | `getConnections()`, `saveConnection(conn)`, `deleteConnection(id)`, `getDismissedSeeds()` |
+| **Connections** | `getConnections()`, `saveConnection(conn)`, `deleteConnection(id)`, `getDismissedSeeds()`, `getFavoriteConnectionIds()`, `toggleFavoriteConnection(id)`, `getConnectionOrder()`, `setConnectionOrder(order)` |
 | **History** | `getHistory()`, `addToHistory(item)`, `clearHistory()` |
 | **Saved Queries** | `getSavedQueries()`, `saveQuery(query)`, `deleteSavedQuery(id)` |
 | **Schema Snapshots** | `getSchemaSnapshots(connId?)`, `saveSchemaSnapshot(snap)`, `deleteSchemaSnapshot(id)` |
@@ -981,7 +1001,7 @@ When a user first enables server mode (or a new user logs in for the first time)
 1. Hook detects serverMode = true
 2. Checks localStorage('libredb_server_migrated') flag
 3. If not migrated:
-   a. Reads whichever of the 10 collections exist in localStorage (a fresh browser with none simply sets the flag and skips)
+   a. Reads whichever of the 12 collections exist in localStorage (a fresh browser with none simply sets the flag and skips)
    b. POST /api/storage/migrate with the collected payload
    c. Server calls provider.mergeData() — upserts each collection as a whole blob in one transaction
    d. Sets 'libredb_server_migrated' flag in localStorage

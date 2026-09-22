@@ -1,10 +1,10 @@
 import React from "react";
-import { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 import { Key, Hash } from "lucide-react";
 
 interface ColumnListProps {
-  columns: TableSchema["columns"];
-  indexes: TableSchema["indexes"];
+  columns: DetailedObject["columns"];
+  indexes: DetailedObject["indexes"];
 }
 
 // Static marker for non-primary columns, hoisted to module scope: the element
@@ -29,7 +29,10 @@ export const ColumnList = React.memo(function ColumnList({ columns, indexes }: C
             {column.name}
           </span>
 
-          <span className="text-xs font-mono text-muted-foreground/60 uppercase group-hover/col:text-muted-foreground">
+          <span
+            className="text-xs font-mono text-muted-foreground/60 uppercase group-hover/col:text-muted-foreground shrink-0 max-w-[40%] truncate"
+            title={column.type}
+          >
             {column.type.split("(")[0]}
           </span>
         </div>

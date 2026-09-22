@@ -93,6 +93,8 @@ export function ConnectionModal({
     setSchema,
     queryTimeout,
     setQueryTimeout,
+    skipObjectScan,
+    setSkipObjectScan,
     connectionString,
     setConnectionString,
     mongoConnectionMode,
@@ -133,6 +135,10 @@ export function ConnectionModal({
     setLocalDataCenter,
     authSource,
     setAuthSource,
+    apiKeyId,
+    setApiKeyId,
+    apiKeySecret,
+    setApiKeySecret,
 
     // SSH Tunnel
     showSSH,
@@ -307,6 +313,29 @@ export function ConnectionModal({
             />
             <p id="queryTimeout-hint" className="text-xs text-fg-muted">
               Leave blank to use the default of 60 seconds.
+            </p>
+          </div>
+
+          {/*
+            The no-scan escape hatch (#765). Beside the timeout rather than behind the
+            Advanced accordion, and not gated on the engine: every engine has a catalog,
+            and the connection that holds tens of thousands of objects is the one that
+            knows it does.
+          */}
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                id="skipObjectScan"
+                type="checkbox"
+                checked={skipObjectScan}
+                onChange={(e) => setSkipObjectScan(e.target.checked)}
+                aria-describedby="skipObjectScan-hint"
+                className="rounded border-edge bg-panel"
+              />
+              <span className="text-xs font-mediumr text-fg-muted">Do not read the object list on connect</span>
+            </label>
+            <p id="skipObjectScan-hint" className="text-xs text-fg-muted">
+              The editor still works. The object panel offers a load action instead.
             </p>
           </div>
 
@@ -625,6 +654,58 @@ export function ConnectionModal({
                       <p className="text-xs text-fg-muted">
                         The database the user was created in, usually admin. Leave empty when the credentials live in
                         the database above.
+                      </p>
+                    </div>
+                  )}
+
+                  {/*
+                    In the open for the same reason as MongoDB's field above: this is the
+                    scheme the issue (#708) exists because operators prefer over Basic, so
+                    hiding it behind Advanced would bury the reason most people open this
+                    form for this engine. Username/password stay visible too rather than
+                    disappearing when a key is typed - buildConnection decides at save time
+                    whether both, one or neither end up on the connection, and the
+                    transport's own precedence (the key wins when both are set) is stated
+                    once, at the constructor in http-transport.ts, not duplicated here.
+                  */}
+                  {takesConnectionField(type, "apiKeyId") && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 mb-1">
+                          <Key strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                          <Label htmlFor="apiKeyId" className="text-xs font-medium text-fg-muted">
+                            API Key ID
+                          </Label>
+                        </div>
+                        <Input
+                          id="apiKeyId"
+                          value={apiKeyId}
+                          onChange={(e) => setApiKeyId(e.target.value)}
+                          placeholder="EWkMhKACjF5eHMlg6Car"
+                          autoComplete="off"
+                          className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 mb-1">
+                          <ShieldCheck strokeWidth={1.5} className="w-3 h-3 text-fg-muted" />
+                          <Label htmlFor="apiKeySecret" className="text-xs font-medium text-fg-muted">
+                            API Key Secret
+                          </Label>
+                        </div>
+                        <Input
+                          id="apiKeySecret"
+                          type="password"
+                          value={apiKeySecret}
+                          onChange={(e) => setApiKeySecret(e.target.value)}
+                          placeholder="***"
+                          autoComplete="new-password"
+                          className="h-10 bg-panel border-hairline focus:border-brand-tint/50 transition-all text-xs font-mono"
+                        />
+                      </div>
+                      <p className="text-xs text-fg-muted md:col-span-2">
+                        Kibana shows this pair under the key's "Beats" or "Logstash" format. Preferred over
+                        username/password when both are set; leave either half empty to fall back to them.
                       </p>
                     </div>
                   )}

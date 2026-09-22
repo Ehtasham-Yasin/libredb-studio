@@ -13,12 +13,15 @@
   <a href="README_zh.md">简体中文</a> ·
   <b>日本語</b> ·
   <a href="README_es.md">Español</a> ·
-  <a href="README_ur.md">اردو</a>
+  <a href="README_ur.md">اردو</a> ·
+  <a href="README_hi.md">हिन्दी</a>
 </p>
 
 <p align="center">
   PostgreSQL プロジェクトに掲載：
   <a href="https://www.postgresql.org/about/news/libredb-studio-an-open-source-self-hosted-sql-ide-for-postgresql-in-the-browser-3368/">News</a>
+  ·
+  <a href="https://wiki.postgresql.org/wiki/PostgreSQL_Clients#LibreDB_Studio">PostgreSQL Clients</a>
   ·
   <a href="https://www.postgresql.org/download/products/1/">Software Catalogue</a>
   ·
@@ -29,7 +32,10 @@
   <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>、
   <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>、
   <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>、
-  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>、
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>、
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>、
+  <a href="https://opensearch.org/community-projects/">OpenSearch</a>
   の公式ドキュメントにも掲載
 </p>
 
@@ -43,6 +49,8 @@
   <a href="https://codecov.io/github/libredb/libredb-studio"><img src="https://codecov.io/github/libredb/libredb-studio/graph/badge.svg?token=VA6CO9R7IH" alt="Coverage"></a>
   <a href="https://artifacthub.io/packages/helm/libredb-studio/libredb-studio"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/libredb-studio" alt="Artifact Hub"></a>
 </p>
+
+> この日本語 README はコミュニティによる翻訳で、英語版より古い場合があります。内容が食い違うときは[英語版](README.md)が正です。
 
 ## クイックスタート
 
@@ -139,22 +147,26 @@ StudioのAIの中心は、エディタの隣にあるエージェントレール
 - **読み取り専用。しかもデータベース自身が保証する**：エージェントが実行するすべての文は、**エージェント
   専用の監査付きパイプライン**を通ります。ドライバに触れる前にポリシー判定・監査イベント・予算計上が行われ
   （`executeAuditedOperation`、`src/lib/db/operations/execution.ts:129`）、読み取り専用の実行プロファイルで
-  動きます（PostgreSQLでは読み取り専用トランザクション、SQLiteでは文ごとに`PRAGMA query_only`を再宣言、DuckDBでは`READ_ONLY`のエンジンハンドルに加えてSQLレベルのガード。そのフラグだけでは`COPY … TO`、`EXPORT DATABASE`、ローカルファイルを読むテーブル関数が通ってしまうためです）。
+  動きます（PostgreSQLでは読み取り専用トランザクション、SQLiteでは文ごとに`PRAGMA query_only`を再宣言、DuckDBでは`READ_ONLY`のエンジンハンドルに加えてSQLレベルのガード。そのフラグだけでは`COPY … TO`、`EXPORT DATABASE`、ローカルファイルを読むテーブル関数が通ってしまうためです。読み取り専用トランザクションがそもそも存在しないSQL Serverでは、接続を開く時点でセッションのプリンシパルが書けないことを検証し、オプティマイザが各文を実行せずにコンパイルだけして受け入れ、行数をサーバー側で制限し、必ずロールバックされるトランザクションの中で実行します）。
   書き込みとDDLはデータベースに届く前に拒否され、`EXPLAIN ANALYZE`は文を実際に実行してしまうため既定で
   不許可です。このパイプラインはエージェント専用です。あなたがエディタで自分で実行する文はプロバイダを直接
   呼び出しており（`src/app/api/db/query/route.ts:44`）、ここでのポリシー判定も監査も受けません。
-- **Agentモードが対応するのはPostgreSQL・SQLite・DuckDBだけ**：読み取り専用プロファイルはデータベース側の
-  機能で保証されるため、それを実装したプロバイダにしか存在しません。`postgres.ts:915`、`sqlite.ts:537`、
-  `duckdb/index.ts:525`の`queryReadOnly`のみで、他にはありません。それ以外のエンジンでは、Agentモードの実行は
-  `engine-unsupported`で終わります（`src/lib/agent/runtime.ts:199`）。**Plan**モードはツールを使わず、
-  データベースにまったくアクセスしないため、どの接続でも利用できます。
+- **Agentモードが対応するのはPostgreSQL・SQLite・DuckDB・SQL Serverだけ**：読み取り専用プロファイルはデータベース側の
+  機能で保証されるため、それを実装したプロバイダにしか存在しません。`postgres.ts`、`sqlite.ts`、`duckdb/index.ts`、
+  `mssql.ts`の`queryReadOnly`のみで、他にはありません。それ以外のエンジンでは、文を送るワークフローのAgentモードは
+  開始時点で拒否され、Runは作られません。プロバイダのファクトリまで到達したものは`engine-unsupported`で終わります。
+  **Plan**モードはどの接続でも開けます。そこでのモデルはツールを使わず、あなたの文を1つも実行せず、何も書き込まず、
+  あなた自身が実行するための文を起草するだけです。そのGROUNDINGはすべてのエンジンに届きます。PostgreSQLとSQLiteでは
+  サーバーがカタログ文を自分で組み立て、それ以外の接続ではその接続のプロバイダにスキーマを記述させます。サイドバーが
+  すでに行っている読み取りと同じもので、読み取り専用の文の経路を必要としません。つまり2つの制限は別物です。Agentモードは
+  この4つのエンジン、GROUNDINGはすべてのエンジンであり、読み取りに失敗したRunはテーブルをでっち上げず、そのことを明示します。
 - **3つのワークフロー**：**Investigate**（質問に答える）、**Optimize**（推定プランを比較し、インデックスや
   書き換えを提案）、**Assess**（テーブルのプロファイリング。件数だけで、値は決して読み出しません）。
 - **勝手には動きません**：エージェントが自分でRunを開始することはなく、エディタに書き込むこともなく、
   提案した文を実行することもありません。適用するかどうかはあなたのクリックです。
 - **根拠がなければ主張もない**：引用のない主張は記録できません。Runの最後には「Run answered」または
   「Run did not answer」と明示されます。
-- **上限があり、画面に出ています**：1Runあたり20文、データベース時間60秒、1読み取り200行、実行時間5分。
+- **上限があり、画面に出ています**：ワークフローにより1Runあたり18〜45文、実行時間360〜900秒、1読み取り200行。ワークフローごとの正確な数値は [docs/AGENT.md](docs/AGENT.md) を参照してください。
 - **モデルは自分のもの**：Gemini（既定）、OpenAI、Ollama、またはOpenAI互換の任意のエンドポイント。
   **Agent**モードにはツール呼び出しに対応したモデルが必要で、Ollamaではそれをベンダーの資料ではなく実際の
   プローブで確かめます。**Plan**モードはツールを必要とせず、プローブも行われないため
@@ -265,7 +277,7 @@ StudioがMITなのは、あらゆる場所に置ける必要があるからで�
 
 ## テストと品質
 
-- ユニット、API、統合、hooks、コンポーネント、E2Eの6層
+- ユニット、API、統合、hooks、security、evals、コンポーネントの7層、さらにE2E
 - **行カバレッジ100%**、しかもCIの必須ゲート。下がればマージできません
 - SonarCloud品質ゲート
 - リリースごとにNode 24 / 26でスモークテスト

@@ -43,6 +43,15 @@ interface UseQueryExecutionParams {
   transactionActive: boolean;
   playgroundMode: boolean;
   fetchSchema: (conn: DatabaseConnection) => Promise<void>;
+  /**
+   * Tell the object tree its catalog changed (#789).
+   *
+   * Separate from `fetchSchema`, and the split is not cosmetic: `fetchSchema` re-reads the
+   * flat inventory the diagram, the profiler and the modals draw from, while the tree holds
+   * its OWN lazy cache of counts and listings that nothing else can reach. Both are driven by
+   * the same `schemaRefreshPattern`, and until this existed only the first one was refreshed.
+   */
+  onObjectsChanged?: () => void;
   queryEditorRef: RefObject<QueryEditorRef | null>;
 }
 
@@ -112,6 +121,7 @@ export function useQueryExecution({
   transactionActive,
   playgroundMode,
   fetchSchema,
+  onObjectsChanged,
   queryEditorRef,
 }: UseQueryExecutionParams) {
   /**
@@ -204,13 +214,26 @@ export function useQueryExecution({
   const { toast } = useToast();
 
   // Unified executeQuery — handles both normal and force (skipSafety) execution
+  /**
+   * Runs one statement against the active connection and writes the outcome into the
+   * target tab.
+   *
+   * Returns whether the statement ran and the engine accepted it. Every failure is
+   * still reported here — the toast, the tab flags and the history entry are unchanged
+   * — but the answer is now handed back as well, because a caller running statements in
+   * a loop cannot see a toast. Applying inline grid edits ran that loop and reported
+   * "Changes Applied" whatever happened, dropping the user's pending edits after a write
+   * the engine had refused (#882). `false` covers every way a run can fail to land: no
+   * connection, the safety dialog taking over, an unsupported EXPLAIN, a cancellation,
+   * a thrown request, and a multi-statement run the engine reported an error for.
+   */
   const executeQuery = useCallback(
     async (
       overrideQuery?: string,
       tabId?: string,
       isExplain: boolean = false,
       executionOptions?: QueryExecutionOptions,
-    ) => {
+    ): Promise<boolean> => {
       const activeTabId = activeTabIdRef.current;
       const targetTabId = tabId || activeTabId;
       const tabToExec = tabsRef.current.find((t) => t.id === targetTabId) || currentTabRef.current;
@@ -226,7 +249,7 @@ export function useQueryExecution({
 
       if (!activeConnection) {
         toast({ title: "No Connection", description: "Select a connection first.", variant: "destructive" });
-        return;
+        return false;
       }
 
       // Safety check for dangerous queries (skip for explain, load-more, playground, and force-execute)
@@ -241,7 +264,7 @@ export function useQueryExecution({
         isDangerousQuery(queryToExecute, activeConnection.type)
       ) {
         setSafetyCheckQuery(queryToExecute);
-        return;
+        return false;
       }
 
       // Options extraction
@@ -282,7 +305,7 @@ export function useQueryExecution({
         setTabs((prev) =>
           prev.map((t) => (t.id === targetTabId ? { ...t, isExecuting: false, isLoadingMore: false } : t)),
         );
-        return;
+        return false;
       }
 
       const startTime = Date.now();
@@ -470,7 +493,7 @@ export function useQueryExecution({
           if (errorCode === ApiErrorCode.QUERY_CANCELLED) {
             commitToTab((t) => ({ ...t, isExecuting: false, isLoadingMore: false }));
             toast({ title: "Query Cancelled", description: "Query execution was cancelled." });
-            return;
+            return false;
           }
 
           throw new Error(errorMessage);
@@ -497,6 +520,40 @@ export function useQueryExecution({
           setHistoryKey((prev) => prev + 1);
         }
 
+        /**
+         * A statement that opened a transaction and did not finish it has had it rolled back by
+         * the server, because the connection handle is shared and an unfinished transaction would
+         * otherwise reach the next person to use it (D71, D87). The author is told either way:
+         * before this, the work simply vanished.
+         *
+         * ON BOTH PATHS, and it was on neither but the script one until D87. `/api/db/query`
+         * gained the same `openTransaction` field when the ender learned to name the caller's own
+         * call scope, and the route's own comment claimed the client rendered it "from the field's
+         * presence alone". MEASURED FALSE: the notice lived inside the `multiStatement` branch, and
+         * a single statement never sets that flag. So a reader who typed a lone `BEGIN` had it
+         * silently rolled back and their next statement autocommitted instead of joining the
+         * transaction they had asked for, which is exactly the harm this notice exists to prevent.
+         */
+        // THE KEYWORD IS THE ENGINE'S, not SQL's. This sentence said "Add COMMIT" while the only
+        // caller of the ender was a SQL script route. D74 gave the single-statement route the same
+        // `finally`, and `redis` implements the surface, so the notice now reaches a reader whose
+        // open transaction is a `MULTI` and whose keyword is `EXEC`. Naming the wrong one tells
+        // them to type a command their engine does not have.
+        const keepKeyword = activeConnection.type === "redis" ? "EXEC" : "COMMIT";
+        const transactionNotice =
+          resultData.openTransaction === "rolled-back"
+            ? ` This left a transaction open and it was rolled back, so its changes were discarded. Add ${keepKeyword} to keep them.`
+            : "";
+
+        // A lone statement gets no summary toast of its own, so the notice is the whole message:
+        // raised only when there IS something to say, never as a toast about an ordinary success.
+        if (!resultData.multiStatement && transactionNotice !== "") {
+          toast({
+            title: "Transaction rolled back",
+            description: transactionNotice.trim(),
+          });
+        }
+
         // Show multi-statement summary
         if (resultData.multiStatement) {
           const { executedCount, statementCount, hasError } = resultData;
@@ -504,13 +561,13 @@ export function useQueryExecution({
             const errorStmt = resultData.statements?.find((s: { status: string }) => s.status === "error");
             toast({
               title: `Executed ${executedCount - 1}/${statementCount} statements`,
-              description: `Error in statement ${errorStmt?.index + 1}: ${errorStmt?.error}`,
+              description: `Error in statement ${errorStmt?.index + 1}: ${errorStmt?.error}${transactionNotice}`,
               variant: "destructive",
             });
           } else {
             toast({
               title: `${executedCount} statements executed`,
-              description: `All ${statementCount} statements completed in ${resultData.executionTime}ms`,
+              description: `All ${statementCount} statements completed in ${resultData.executionTime}ms.${transactionNotice}`,
             });
           }
         }
@@ -551,8 +608,22 @@ export function useQueryExecution({
 
             return {
               ...t,
+              // The page appended here is what this run fetched, so the tab names it for
+              // the same reason the replace branch does: a reader of the rows must never
+              // be handed a different statement's name for them.
+              resultQuery: queryToExecute,
               result: {
                 ...resultData,
+                // THE SHAPE COMES FROM THE ROWS ON SCREEN, NOT FROM THE PAGE THAT ARRIVED.
+                //
+                // A page of the same statement cannot legitimately name different columns,
+                // and an empty page often names none at all: SQLite answers `... LIMIT 50
+                // OFFSET 100` on a hundred-row table with `rows: 0, fields: []`. Spreading
+                // that over the tab left the grid holding its hundred rows under zero
+                // columns - the strip read "100 rows / 0 columns" and the table rendered
+                // header-less, cell-less stripes. A table whose size is an exact multiple
+                // of the page size reaches that state in one click.
+                fields: resultData.fields.length > 0 ? resultData.fields : t.result.fields,
                 rows: newAllRows,
                 rowCount: newAllRows.length,
               },
@@ -567,6 +638,10 @@ export function useQueryExecution({
           return {
             ...t,
             result: isExplain ? null : resultData, // Don't show EXPLAIN as results
+            // The rows and the statement that fetched them are committed together, so a
+            // reader of one can never be handed the other's (#881). An EXPLAIN leaves the
+            // results alone, so it leaves this alone too.
+            resultQuery: isExplain ? t.resultQuery : queryToExecute,
             allRows: isExplain ? t.allRows : resultData.rows,
             currentOffset: isExplain ? t.currentOffset : resultData.rows.length,
             isExecuting: false,
@@ -597,6 +672,9 @@ export function useQueryExecution({
         if (!isExplain && !isPlaygroundRun && metadata) {
           if (shouldRefreshSchema(queryToExecute, metadata.capabilities.schemaRefreshPattern)) {
             fetchSchema(activeConnection);
+            // The tree's cache is its own and nothing else can reach it, so the same statement
+            // that re-reads the inventory has to say so here too.
+            onObjectsChanged?.();
           }
         }
 
@@ -609,6 +687,15 @@ export function useQueryExecution({
         if (!isExplain && !isLoadMore && !resultData.hasError) {
           maybeInviteToStar();
         }
+
+        // The run reached the engine and the engine accepted it. `hasError` is the
+        // multi-statement path's own signal — the request succeeds while one of the
+        // statements inside it did not — so it is the same answer, not a separate one.
+        //
+        // A SUPERSEDED run reports false whatever the engine said. `commitToTab` dropped
+        // its result, so nothing it did is on screen, and a caller counting applied rows
+        // would otherwise count one the user never sees.
+        return !resultData.hasError && !isSuperseded();
       } catch (error) {
         // Playground mode: rollback on error too
         if (isPlaygroundRun) {
@@ -634,17 +721,23 @@ export function useQueryExecution({
           if (!superseded) {
             toast({ title: "Query Cancelled", description: "Query execution was cancelled." });
           }
-          return;
+          return false;
         }
 
-        const title = "Query Error";
+        // A LOST PAGE IS NOT A LOST QUERY (#816). Under the generic title the user reads
+        // their own statement as having failed, when the rows on screen are intact and
+        // only the next page did not arrive. `use-query-adapter.ts` raises the same
+        // wording for the same failure, so the standalone app and the embedded workspace
+        // say one thing.
+        const title = isLoadMore ? "Load More Error" : "Query Error";
         const errorMessage = error instanceof Error ? error.message : "Unknown error";
         // Fallback string check for cancellation errors not caught by response code
         if (errorMessage.includes("Query was cancelled") || errorMessage.includes("cancelled")) {
           toast({ title: "Query Cancelled", description: "Query execution was cancelled." });
-          return;
+          return false;
         }
         toast({ title, description: errorMessage, variant: "destructive" });
+        return false;
       } finally {
         // Only the run that still owns this tab's slot may clear it. A superseded
         // run finishes AFTER its replacement started, and deleting the entry here
@@ -655,7 +748,17 @@ export function useQueryExecution({
         }
       }
     },
-    [activeConnection, toast, fetchSchema, metadata, transactionActive, playgroundMode, setTabs, queryEditorRef],
+    [
+      activeConnection,
+      toast,
+      fetchSchema,
+      onObjectsChanged,
+      metadata,
+      transactionActive,
+      playgroundMode,
+      setTabs,
+      queryEditorRef,
+    ],
   );
 
   // Force execute (bypass safety check) — unified via skipSafety flag
@@ -799,10 +902,26 @@ export function useQueryExecution({
   // Load More handler
   const handleLoadMore = useCallback(() => {
     if (!currentTab.result?.pagination?.hasMore) return;
+    // Restates the condition the rendered control already enforces: the button that calls
+    // this is `disabled={isLoadingMore}` in `StatsBar`, and the flag is wired end to end.
+    // It reads render state rather than a ref, so it cannot be more than that - two calls
+    // in the same tick would both read the value from before `executeQuery` claims the
+    // tab and both pass. It is a second line behind the disabled control, not a
+    // replacement for it, and a caller that renders no such control has to enforce the
+    // invariant itself (#816).
+    if (currentTab.isLoadingMore) return;
 
     const currentOffset = currentTab.currentOffset || currentTab.result.rows.length;
-    executeQuery(currentTab.query, currentTab.id, false, {
-      limit: 500,
+    // The next page of the STATEMENT THAT BUILT THIS GRID, not of whatever has been typed
+    // since. The editor buffer is rewritten on every keystroke, and a run takes the
+    // editor's effective query, which may be only a selection of it - so paging the buffer
+    // appended another table's rows under these columns and left the tab holding rows from
+    // two tables while naming one (#881).
+    executeQuery(currentTab.resultQuery ?? currentTab.query, currentTab.id, false, {
+      // The size of the page already on screen, not a constant. A table preview is 50
+      // rows and a hand-run statement is 500, and a hardcoded 500 made the second page
+      // ten times the first while the footer's own label promised 500 either way (#816).
+      limit: currentTab.result.pagination.limit,
       offset: currentOffset,
     });
   }, [currentTab, executeQuery]);

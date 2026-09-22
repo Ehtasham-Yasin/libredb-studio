@@ -12,7 +12,10 @@ import {
 } from "./types";
 import { DatabaseConfigError, ExecutionProfileError } from "./errors";
 import { createSSHTunnel, closeSSHTunnel, hasTunnel } from "@/lib/ssh/tunnel";
+import type { TunnelInfo } from "@/lib/ssh/tunnel";
 import { readSecret } from "@/lib/storage/encryption";
+import { providerCacheKey } from "./provider-cache-key";
+import { TUNNEL_FAR_END, type WithTunnelFarEnd } from "@/lib/types";
 import { logger } from "@/lib/logger";
 import * as path from "path";
 
@@ -60,13 +63,23 @@ import * as path from "path";
  * const result = await provider.query('SELECT * FROM users');
  * await provider.disconnect();
  */
+/**
+ * Strip the control characters a log line's framing is made of, so a caller-supplied value
+ * cannot write a line of its own.
+ *
+ * Hoisted out of `createDatabaseProvider`, where it guarded `type` and `name`, once
+ * `connection.id` was established to be caller-supplied too (GHSA-3wh2-8x78-jfw4 - see
+ * {@link providerCacheKey}). Every site below that INTERPOLATES an id into a message uses it;
+ * the ids passed as structured logger FIELDS do not need it, because a field is never parsed
+ * as part of the line.
+ */
+const sanitize = (v: string) => v.replace(/[\r\n]/g, " ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+
 export async function createDatabaseProvider(
   connection: DatabaseConnection,
   options: ProviderOptions = {},
   execution: ProviderExecutionContext = {},
 ): Promise<DatabaseProvider> {
-  // Sanitize user-controlled values to prevent log injection
-  const sanitize = (v: string) => v.replace(/[\r\n]/g, " ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
   console.log(`[DB] Creating ${sanitize(connection.type)} provider for "${sanitize(connection.name || "")}"`);
 
   // Explicit overrides (such as the connectivity probe) take precedence over saved settings.
@@ -106,7 +119,7 @@ export async function createDatabaseProvider(
 
     case "mssql": {
       const { MSSQLProvider } = await import("./providers/sql/mssql");
-      return new MSSQLProvider(connection, options);
+      return new MSSQLProvider(connection, options, execution);
     }
 
     case "clickhouse": {
@@ -185,11 +198,58 @@ export async function createDatabaseProvider(
       throw new DatabaseConfigError(
         // This list is NOT type-checked against the union - a new case above with no
         // entry here is silent - so it is kept in the same order as the cases and
-        // tests/unit/db/factory.test.ts pins individual names in it by regex.
+        // tests/isolated/factory.test.ts pins individual names in it by regex.
         `Unknown database type: ${connection.type}. Supported types: postgres, mysql, sqlite, duckdb, libsql, oracle, mssql, clickhouse, druid, trino, cassandra, elasticsearch, opensearch, mongodb, couchbase, redis, libredb`,
         connection.type,
       );
   }
+}
+
+// ============================================================================
+// SSH tunnel rewrite (#457, X23)
+// ============================================================================
+
+/**
+ * The connection a provider is built with when its traffic goes through an SSH tunnel: `host`
+ * and `port` point at the tunnel's LOCAL endpoint, which is where the driver must dial, and the
+ * address that endpoint FORWARDS TO, read back off the tunnel, travels with them under
+ * `TUNNEL_FAR_END`.
+ *
+ * The far end is carried because the rewrite alone made the whole tunnelled population unable to
+ * edit anything (X23). A provider seals every object edit plan with
+ * `connectionFingerprint(this.config)` and the edit routes recompute that digest from the record
+ * the request resolved, so a config that says `127.0.0.1:<ephemeral>` and a record that says
+ * `db.internal:5432` compared unequal on every attempt: the reader could open the object, could
+ * read it, and could never edit it.
+ *
+ * It is NOT on `ProviderOptions`, for the reason `ProviderExecutionContext`'s docblock already
+ * gives about a profile flag: options are caller-supplied and flow all the way into
+ * `getOrCreateProvider`, and a value the seal depends on must not be settable by whoever builds
+ * the options for a request. A symbol key is the same footing reached differently - see
+ * `TUNNEL_FAR_END` in `src/lib/types.ts` for what stops a stored connection carrying one.
+ *
+ * `base` is the connection as the caller already holds it - `acquireExecutionProfileProvider` has
+ * substituted the agent credential onto it by the time it gets here - and only `host` and `port`
+ * are replaced. The far end is not read off it at all, which is the point of the paragraph below.
+ *
+ * THE FAR END COMES OFF THE TUNNEL, never off the record, and that is why this helper takes no
+ * separate `farEnd` argument (D86). A pooled tunnel is not always the one this call opened, so
+ * the address the caller ASKED to forward to and the address the forward reaches are two
+ * different facts. MEASURED 2026-09-15 against the live bastion, no mocks: with the pool keyed
+ * on the connection id alone, a provider built on the id of a tunnel to `pg-p3fix:5432` with the
+ * record changed to `db-elsewhere.invalid:6543` dialled the existing forward, answered
+ * `libredb_dev` at `172.23.0.2`, and sealed `db-elsewhere.invalid:6543` - which is exactly what
+ * the edit routes recompute, so that plan verified against a machine the statement never reached.
+ * Two things closed it: `TunnelInfo` now carries `remoteHost`/`remotePort`, and the pool keys on
+ * them and on the bastion route, so a request for a forward nothing has opened opens its own.
+ */
+function tunnelledConnection(base: DatabaseConnection, tunnel: TunnelInfo): DatabaseConnection & WithTunnelFarEnd {
+  return {
+    ...base,
+    host: tunnel.localHost,
+    port: tunnel.localPort,
+    [TUNNEL_FAR_END]: { host: tunnel.remoteHost, port: tunnel.remotePort },
+  };
 }
 
 // ============================================================================
@@ -236,7 +296,7 @@ export async function withOneShotTunnel<T>(
   });
 
   try {
-    return await run({ ...connection, host: tunnel.localHost, port: tunnel.localPort });
+    return await run(tunnelledConnection(connection, tunnel));
   } finally {
     // Swallowed on purpose: a failing teardown must not replace the caller's error,
     // which is the one that says why the database connection did not work.
@@ -251,6 +311,12 @@ export async function withOneShotTunnel<T>(
 interface CachedProvider {
   provider: DatabaseProvider;
   lastUsed: number;
+  /**
+   * The connection this entry serves. It is NOT the cache key - see
+   * {@link providerCacheKey} for why the key may not be a string the caller typed. Every
+   * "which entries serve connection X" question matches on this field.
+   */
+  connectionId: string;
   /**
    * The file this entry holds open, when the provider declares
    * `ProviderCapabilities.singleWriterFile` - see `findOpenSingleWriterProvider`.
@@ -341,19 +407,27 @@ export function findOpenSingleWriterProvider(connection: DatabaseConnection): Da
 // Keyed by (connection id, execution profile).
 // ============================================================================
 
-interface ProfiledCachedProvider extends CachedProvider {
-  connectionId: string;
-}
+type ProfiledCachedProvider = CachedProvider;
 
 const profiledProviderCache = new Map<string, ProfiledCachedProvider>();
 
-function profiledCacheKey(connectionId: string, profile: ExecutionProfile): string {
-  return `${profile}::${connectionId}`;
+/**
+ * The profiled cache's key, which is the shared cache's key with the profile framed onto it
+ * (GHSA-3wh2-8x78-jfw4). It used to be `${profile}::${connection.id}`, so it carried the same
+ * forgeable id and was reachable by the same forgery - reproduced on this path too, in
+ * `tests/isolated/factory.test.ts`. {@link providerCacheKey} states the whole argument.
+ *
+ * The profile stays in the key because the two caches' isolation is per profile: an
+ * `agent-read-only` acquisition may never be served what `agent-operations` opened.
+ */
+async function profiledCacheKey(connection: DatabaseConnection, profile: ExecutionProfile): Promise<string> {
+  const key = await providerCacheKey(connection);
+  return `${profile.length}:${profile}${key}`;
 }
 
 /** True when any provider — shared or profiled — still serves this connection. */
 function connectionStillServed(connectionId: string): boolean {
-  if (providerCache.has(connectionId)) return true;
+  if (Array.from(providerCache.values()).some((entry) => entry.connectionId === connectionId)) return true;
   return Array.from(profiledProviderCache.values()).some((entry) => entry.connectionId === connectionId);
 }
 
@@ -374,17 +448,24 @@ export async function evictIdleProviders(maxIdleMs: number = IDLE_TIMEOUT_MS): P
   const now = Date.now();
   let evicted = 0;
 
-  for (const [id, entry] of providerCache) {
+  for (const [key, entry] of providerCache) {
     if (now - entry.lastUsed >= maxIdleMs) {
-      logger.info(`[DB] Evicting idle provider: ${id} (idle ${Math.round((now - entry.lastUsed) / 60000)}min)`);
+      const id = entry.connectionId;
+      logger.info(
+        `[DB] Evicting idle provider: ${sanitize(id)} (idle ${Math.round((now - entry.lastUsed) / 60000)}min)`,
+      );
       try {
         await entry.provider.disconnect();
       } catch (error) {
-        logger.warn(`[DB] Error disconnecting idle provider ${id}`, { connectionId: id, error: String(error) });
+        logger.warn(`[DB] Error disconnecting idle provider ${sanitize(id)}`, {
+          connectionId: id,
+          error: String(error),
+        });
       }
-      providerCache.delete(id);
+      providerCache.delete(key);
       // Close the shared tunnel only when nothing serves the connection
-      // anymore — a live profiled provider still needs it.
+      // anymore — a live profiled provider still needs it, and so does another
+      // entry of this connection opened with different credentials.
       if (!connectionStillServed(id)) {
         try {
           await closeSSHTunnel(id);
@@ -400,11 +481,11 @@ export async function evictIdleProviders(maxIdleMs: number = IDLE_TIMEOUT_MS): P
   // connection id, so it is closed only once nothing serves that connection.
   for (const [key, entry] of profiledProviderCache) {
     if (now - entry.lastUsed >= maxIdleMs) {
-      logger.info(`[DB] Evicting idle profiled provider: ${key}`);
+      logger.info(`[DB] Evicting idle profiled provider: ${sanitize(entry.connectionId)}`);
       try {
         await entry.provider.disconnect();
       } catch (error) {
-        logger.warn(`[DB] Error disconnecting idle profiled provider ${key}`, {
+        logger.warn(`[DB] Error disconnecting idle profiled provider ${sanitize(entry.connectionId)}`, {
           connectionId: entry.connectionId,
           error: String(error),
         });
@@ -453,7 +534,7 @@ export async function getOrCreateProvider(
   connection: DatabaseConnection,
   options: ProviderOptions = {},
 ): Promise<DatabaseProvider> {
-  const cacheKey = connection.id;
+  const cacheKey = await providerCacheKey(connection);
 
   // Check cache
   const cached = providerCache.get(cacheKey);
@@ -475,21 +556,20 @@ export async function getOrCreateProvider(
   }
 
   // If SSH tunnel is configured, create tunnel first and rewrite connection.
-  // createSSHTunnel returns a pre-existing tunnel for the same connection id,
-  // so remember whether this call actually created it — only a fresh tunnel
-  // may be torn down on failure (a pre-existing one may still serve an
-  // execution-profile provider).
+  // createSSHTunnel returns a pre-existing tunnel for the same connection id, bastion route
+  // AND far end, so ask about exactly that forward — only a tunnel this call created may be
+  // torn down on failure (a pre-existing one may still serve an execution-profile provider).
   let effectiveConnection = connection;
-  const tunnelPreexisted = hasTunnel(connection.id);
-  let tunnel: Awaited<ReturnType<typeof createSSHTunnel>> | null = null;
+  let tunnelPreexisted = false;
+  let tunnel: TunnelInfo | null = null;
   if (connection.sshTunnel?.enabled && connection.host && connection.port) {
+    tunnelPreexisted = hasTunnel(connection.id, {
+      ssh: connection.sshTunnel,
+      farEnd: { host: connection.host, port: connection.port },
+    });
     tunnel = await createSSHTunnel(connection.id, connection.sshTunnel, connection.host, connection.port);
-    // Rewrite connection to point to local tunnel endpoint
-    effectiveConnection = {
-      ...connection,
-      host: tunnel.localHost,
-      port: tunnel.localPort,
-    };
+    // Rewrite connection to point to local tunnel endpoint, keeping the far end for the seal
+    effectiveConnection = tunnelledConnection(connection, tunnel);
   }
 
   // Create new provider (async - dynamically loads the provider module)
@@ -507,7 +587,7 @@ export async function getOrCreateProvider(
   // Cache it, remembering the file when this engine admits only one handle on it -
   // that is what lets the callers that would otherwise open a second one find this.
   const singleWriterFile = provider.getCapabilities().singleWriterFile === true ? fileIdentity(connection) : null;
-  providerCache.set(cacheKey, { provider, lastUsed: Date.now(), singleWriterFile });
+  providerCache.set(cacheKey, { provider, connectionId: connection.id, lastUsed: Date.now(), singleWriterFile });
 
   // Start idle sweep if not already running
   startIdleSweep();
@@ -628,7 +708,7 @@ export async function acquireExecutionProfileProvider(
     throw new ExecutionProfileError(`Unknown execution profile: ${String(profile)}`, "UNSUPPORTED_PROFILE");
   }
 
-  const cacheKey = profiledCacheKey(connection.id, profile);
+  const cacheKey = await profiledCacheKey(connection, profile);
   const cached = profiledProviderCache.get(cacheKey);
   if (cached && cached.provider.config.queryTimeout !== connection.queryTimeout) {
     try {
@@ -679,14 +759,18 @@ export async function acquireExecutionProfileProvider(
     ? { ...connection, user: credential.user, password: credential.password }
     : connection;
 
-  // The SSH tunnel is keyed by connection id and shared with the writable
-  // provider (createSSHTunnel returns the existing one). Only a tunnel this
-  // acquisition freshly created may be torn down on failure.
-  const tunnelPreexisted = hasTunnel(connection.id);
-  let tunnel: Awaited<ReturnType<typeof createSSHTunnel>> | null = null;
+  // The SSH tunnel is keyed by connection id, bastion route and far end, and shared with the
+  // writable provider (createSSHTunnel returns the existing one for that forward). Only a
+  // tunnel this acquisition freshly created may be torn down on failure.
+  let tunnelPreexisted = false;
+  let tunnel: TunnelInfo | null = null;
   if (connection.sshTunnel?.enabled && connection.host && connection.port) {
+    tunnelPreexisted = hasTunnel(connection.id, {
+      ssh: connection.sshTunnel,
+      farEnd: { host: connection.host, port: connection.port },
+    });
     tunnel = await createSSHTunnel(connection.id, connection.sshTunnel, connection.host, connection.port);
-    effectiveConnection = { ...effectiveConnection, host: tunnel.localHost, port: tunnel.localPort };
+    effectiveConnection = tunnelledConnection(effectiveConnection, tunnel);
   }
 
   const closeFreshTunnel = async () => {
@@ -721,15 +805,17 @@ export async function acquireExecutionProfileProvider(
  * not leave a stale agent pool running under the old configuration.
  */
 export async function removeProvider(connectionId: string): Promise<void> {
-  const cached = providerCache.get(connectionId);
-
-  if (cached) {
+  // A connection can hold more than one entry now - one per distinct server-and-credentials
+  // it was opened with - so this removes every entry serving it, the way the profiled loop
+  // below always has.
+  for (const [key, entry] of providerCache) {
+    if (entry.connectionId !== connectionId) continue;
     try {
-      await cached.provider.disconnect();
+      await entry.provider.disconnect();
     } catch (error) {
-      logger.warn(`Error disconnecting provider ${connectionId}`, { connectionId, error: String(error) });
+      logger.warn(`Error disconnecting provider ${sanitize(connectionId)}`, { connectionId, error: String(error) });
     }
-    providerCache.delete(connectionId);
+    providerCache.delete(key);
   }
 
   for (const [key, entry] of profiledProviderCache) {
@@ -737,7 +823,10 @@ export async function removeProvider(connectionId: string): Promise<void> {
     try {
       await entry.provider.disconnect();
     } catch (error) {
-      logger.warn(`Error disconnecting profiled provider ${key}`, { connectionId, error: String(error) });
+      logger.warn(`Error disconnecting profiled provider ${sanitize(connectionId)}`, {
+        connectionId,
+        error: String(error),
+      });
     }
     profiledProviderCache.delete(key);
   }
@@ -746,7 +835,7 @@ export async function removeProvider(connectionId: string): Promise<void> {
   try {
     await closeSSHTunnel(connectionId);
   } catch (error) {
-    logger.warn(`Error closing SSH tunnel for ${connectionId}`, { connectionId, error: String(error) });
+    logger.warn(`Error closing SSH tunnel for ${sanitize(connectionId)}`, { connectionId, error: String(error) });
   }
 }
 
@@ -762,17 +851,19 @@ export async function clearProviderCache(): Promise<void> {
 
   const disconnectPromises: Promise<void>[] = [];
 
-  for (const [id, entry] of providerCache) {
+  for (const entry of providerCache.values()) {
     disconnectPromises.push(
       entry.provider.disconnect().catch((error) => {
-        console.error(`[DB] Error disconnecting provider ${id}:`, error);
+        // The id is an argument, never part of the first one: `console.error`'s first argument
+        // is a format string, and a constant cannot be a format attack (js/tainted-format-string).
+        console.error("[DB] Error disconnecting provider", sanitize(entry.connectionId), error);
       }),
     );
   }
   for (const [key, entry] of profiledProviderCache) {
     disconnectPromises.push(
       entry.provider.disconnect().catch((error) => {
-        console.error(`[DB] Error disconnecting profiled provider ${key}:`, error);
+        console.error("[DB] Error disconnecting profiled provider", sanitize(entry.connectionId), error);
       }),
     );
   }
@@ -788,7 +879,9 @@ export async function clearProviderCache(): Promise<void> {
 export function getProviderCacheStats(): { size: number; connections: string[] } {
   return {
     size: providerCache.size,
-    connections: Array.from(providerCache.keys()),
+    // The ids, never the keys: a key is a digest, and this is observability for
+    // "which connections are open".
+    connections: Array.from(providerCache.values(), (entry) => entry.connectionId),
   };
 }
 

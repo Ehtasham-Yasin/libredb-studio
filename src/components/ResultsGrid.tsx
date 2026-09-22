@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useMemo, useState, useRef, useCallback, useEffect } from "react";
-import { QueryResult } from "@/lib/types";
+import { QueryResult, type DatabaseType } from "@/lib/types";
 import {
   type ColumnDef,
   type SortingState,
@@ -16,7 +16,7 @@ import {
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
-import { ArrowUpDown, ArrowUp, ArrowDown, Eye, Funnel, Lock } from "lucide-react";
+import { ArrowUpDown, ArrowUp, ArrowDown, Eye, Funnel, Lock, Rows3 } from "lucide-react";
 import { toast } from "sonner";
 import {
   type MaskingConfig,
@@ -31,8 +31,11 @@ import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } 
 import { writeToClipboard } from "@/components/copy-button";
 import { ResultCard } from "@/components/results-grid/ResultCard";
 import { RowDetailSheet } from "@/components/results-grid/RowDetailSheet";
-import { StatsBar, LoadMoreFooter } from "@/components/results-grid/StatsBar";
+import { StatsBar } from "@/components/results-grid/StatsBar";
 import { describeWarning, formatCellValue } from "@/components/results-grid/utils";
+import { hasResultOrder } from "@/lib/sql/result-order";
+import { pageOfferFor } from "@/components/results-grid/page-offer";
+import { useDismissOnOutsideClick } from "@/hooks/use-dismiss-on-outside-click";
 
 export interface CellChange {
   rowIndex: number;
@@ -44,6 +47,21 @@ export interface CellChange {
 const CLEAR_FILTER_LABEL = "Clear filter";
 const EMPTY_RESULT_HINT = "The operation was successful, but the result set is currently empty.";
 const ENGINE_WARNINGS_LABEL = "The engine reported:";
+const ROW_DETAIL_COLUMN_ID = "__libredb_row_detail__";
+const ROW_DETAIL_HEADER_TITLE = "Show a row field by field";
+
+/**
+ * A column id for the row detail control that no field of this result already carries.
+ *
+ * A column name is arbitrary SQL output and `SELECT 1 AS "__libredb_row_detail__"` is a
+ * legal statement, so a fixed id would collide with it and the table would hold two
+ * columns under one id - TanStack keys rows and cells by it.
+ */
+function rowDetailColumnId(fields: string[]): string {
+  let id = ROW_DETAIL_COLUMN_ID;
+  while (fields.includes(id)) id = `_${id}`;
+  return id;
+}
 
 /**
  * TanStack Table 9 does not ship every feature to every table: each one is
@@ -72,6 +90,25 @@ interface ResultsGridProps {
   result: QueryResult;
   onLoadMore?: () => void;
   isLoadingMore?: boolean;
+  /**
+   * Whether the provider these rows came from can be asked for the page AFTER this one
+   * (`ProviderCapabilities.supportsResultPagination`, #816).
+   *
+   * Gated on `=== true`, so an absent flag hides the control: five providers cannot page
+   * at all — two throw and three answer a page request with page one — and a control that
+   * can only re-fetch what is already on screen is worse than no control (#269's rule).
+   */
+  supportsResultPagination?: boolean;
+  /**
+   * The statement that produced these rows, for the ordering notice only.
+   *
+   * The tab's `resultQuery` and not the editor buffer: the buffer is rewritten on every
+   * keystroke, and the condition being stated is about the rows on screen. Absent when
+   * the surface cannot name the statement, and then nothing is claimed either way.
+   */
+  resultQuery?: string;
+  /** The dialect `resultQuery` is read under; `#` and `[…]` mean different things (#292). */
+  databaseType?: DatabaseType;
   maskingEnabled?: boolean;
   onToggleMasking?: () => void;
   userRole?: string;
@@ -127,6 +164,9 @@ export function ResultsGrid({
   result,
   onLoadMore,
   isLoadingMore,
+  supportsResultPagination,
+  resultQuery,
+  databaseType,
   maskingEnabled,
   onToggleMasking,
   userRole,
@@ -141,9 +181,31 @@ export function ResultsGrid({
   const [editingCell, setEditingCell] = useState<{ rowIndex: number; columnId: string } | null>(null);
   const [editValue, setEditValue] = useState<string>("");
   const [viewMode, setViewMode] = useState<"card" | "table">("card");
+  const [wrapText, setWrapText] = useState(false);
   const [selectedRow, setSelectedRow] = useState<{ row: Record<string, unknown>; index: number } | null>(null);
   const [columnFilters, setColumnFilters] = useState<Map<string, string>>(new Map());
   const [activeFilterCol, setActiveFilterCol] = useState<string | null>(null);
+  /**
+   * Which fields are hidden, as TanStack's own visibility map (#870).
+   *
+   * `columnVisibilityFeature` has been in `tableFeatureSet` since the grid was written and
+   * nothing ever wrote to it, so `row.getVisibleCells()` could only ever return them all.
+   * The writer is the column count in the stats strip; this is the state it writes.
+   *
+   * Held as the feature's map rather than as a set of hidden names so the table is handed
+   * the shape it already understands, and derived back to a set for the strip, which
+   * should not have to know TanStack's convention that absent means visible.
+   */
+  const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({});
+  /*
+    The filter panel closes on a press outside it. The ref lands on the header cell that is
+    currently showing one, which holds the funnel that opened it as well as the panel, so
+    pressing the funnel again still reaches its own toggle rather than being dismissed here
+    and reopened by the click that follows.
+  */
+  const filterPanelRef = useDismissOnOutsideClick<HTMLDivElement>(activeFilterCol !== null, () =>
+    setActiveFilterCol(null),
+  );
   const [revealedCells, setRevealedCells] = useState<Set<string>>(new Set());
   const [contextCell, setContextCell] = useState<{ rowIndex: number; field: string } | null>(null);
 
@@ -171,9 +233,11 @@ export function ResultsGrid({
     setRevealedCells(new Set());
   }, [result]);
 
+  // The copy menu names a row and a column, and a new result, a new sort or a new filter
+  // can retire either one while a menu still holds them.
   useEffect(() => {
     setContextCell(null);
-  }, [result, result.rows, result.fields, sorting, columnFilters]);
+  }, [result, sorting, columnFilters]);
 
   // Per-cell reveal with auto-hide
   const revealCell = useCallback((key: string) => {
@@ -191,6 +255,8 @@ export function ResultsGrid({
 
   const idColumn = useMemo(() => detectIdColumn(result.fields), [result.fields]);
 
+  const detailColumnId = useMemo(() => rowDetailColumnId(result.fields), [result.fields]);
+
   // Filter rows based on column filters
   const filteredRows = useMemo(() => {
     if (columnFilters.size === 0) return result.rows;
@@ -203,6 +269,37 @@ export function ResultsGrid({
       return true;
     });
   }, [result.rows, columnFilters]);
+
+  /**
+   * Where each visible row sits in `result.rows`.
+   *
+   * The table below is built over `filteredRows`, so TanStack's `row.index` is a position
+   * in the FILTERED array. A `CellChange` carries that number out of this component, and
+   * `useInlineEditing` uses it to read the row's primary key out of `result.rows` — so with
+   * a column filter on, an edit was keyed to whatever row happened to sit at the same
+   * position in the unfiltered result. The engine accepted it and nothing said a word.
+   *
+   * Filtering keeps the row objects themselves, so their identity is the map back. With no
+   * filter the table's data IS `result.rows`, so the two numbers are the same and the map
+   * is not built at all — it is O(rows) on the thread that draws them, and this grid
+   * advertises smooth scrolling through millions.
+   */
+  const sourceRowIndex = useMemo(() => {
+    if (columnFilters.size === 0) return null;
+    const map = new Map<Record<string, unknown>, number>();
+    result.rows.forEach((row, index) => map.set(row, index));
+    return map;
+  }, [result.rows, columnFilters]);
+
+  /**
+   * That map, applied: the position in `result.rows` of a row the table is iterating.
+   * `tableIndex` is TanStack's own number, correct whenever no filter is on.
+   */
+  const resolveSourceIndex = useCallback(
+    (row: Record<string, unknown>, tableIndex: number): number =>
+      sourceRowIndex === null ? tableIndex : (sourceRowIndex.get(row) ?? -1),
+    [sourceRowIndex],
+  );
 
   const activeFilterCount = useMemo(() => {
     let count = 0;
@@ -303,7 +400,45 @@ export function ResultsGrid({
   }, []);
 
   const columns = useMemo<ColumnDef<typeof tableFeatureSet, Record<string, unknown>>[]>(() => {
-    return result.fields.map((field) => ({
+    // `truncate` carries its own `white-space: nowrap`, so wrapping has to replace it here,
+    // on the element holding the value, not only on the cell around it.
+    const valueFlow = wrapText ? "whitespace-pre-wrap break-words" : "truncate h-full";
+
+    /**
+     * The field-by-field view of one row, reachable from the desktop grid (#800).
+     *
+     * It ships as a column rather than as an overlay on the row so it scrolls, sizes
+     * and aligns with the header the way every other cell does, and so no breakpoint
+     * decides whether it is there: the vertical view already existed and was reachable
+     * only below `md`, which is the whole of the reported defect. Wide results are
+     * exactly where it is wanted, so it is sticky at the left edge and stays reachable
+     * after the grid has been scrolled across 200 columns.
+     */
+    const detailColumn: ColumnDef<typeof tableFeatureSet, Record<string, unknown>> = {
+      id: detailColumnId,
+      header: () => <Rows3 strokeWidth={1.5} aria-hidden="true" className="w-3.5 h-3.5" />,
+      cell: ({ row }) => (
+        <button
+          type="button"
+          data-row-detail=""
+          // Named after the row, so a screen reader hears which row it opens rather
+          // than one of N identically named buttons.
+          aria-label={`Show row ${row.index + 1} field by field`}
+          title={ROW_DETAIL_HEADER_TITLE}
+          className="p-1 rounded text-fg-muted hover:text-brand hover:bg-brand-tint/10 transition-colors"
+          onClick={() => setSelectedRow({ row: row.original, index: row.index })}
+        >
+          <Rows3 strokeWidth={1.5} className="w-3.5 h-3.5" />
+        </button>
+      ),
+      size: 36,
+      minSize: 36,
+      maxSize: 36,
+      enableResizing: false,
+      enableSorting: false,
+    };
+
+    const fieldColumns = result.fields.map<ColumnDef<typeof tableFeatureSet, Record<string, unknown>>>((field) => ({
       // `id` + `accessorFn`, never `accessorKey`: TanStack reads a DOT in an
       // accessorKey as a path into the row, so `shipping.city` was fetched as
       // `row.shipping.city` while the row carries the flat key `"shipping.city"` -
@@ -325,7 +460,10 @@ export function ResultsGrid({
         // computed column, which has no catalog entry the schema tree could answer with.
         const declaredType = declaredTypeOf(result.columnTypes, field);
         return (
-          <div className="flex items-center gap-1 select-none group/header w-full">
+          <div
+            className="flex items-center gap-1 select-none group/header w-full"
+            ref={activeFilterCol === field ? filterPanelRef : undefined}
+          >
             <button
               type="button"
               aria-label={`${field}${declaredType ? `, ${declaredType}` : ""}${
@@ -408,7 +546,17 @@ export function ResultsGrid({
       cell: ({ row, column, getValue }) => {
         const val = getValue();
         const isEditing = editingCell?.rowIndex === row.index && editingCell?.columnId === column.id;
-        const pendingChange = getCellChange(row.index, column.id);
+        // A pending change is addressed by its position in `result.rows`, not by the one
+        // the filtered table is iterating, so the lookup and the emission below both go
+        // through the map rather than through `row.index`.
+        // `row.index` only where it is provably the same number — no filter, so the table
+        // iterates `result.rows` itself. Under a filter it is the position this map exists
+        // to stop using, and falling back to it there would restore the wrong-row write in
+        // the one path that reaches the database. Filtering keeps the row objects, so a
+        // miss cannot happen — and if it ever did, -1 addresses no row and the apply
+        // refuses rather than writing somewhere.
+        const sourceIndex = resolveSourceIndex(row.original, row.index);
+        const pendingChange = getCellChange(sourceIndex, column.id);
 
         if (isEditing) {
           return (
@@ -422,7 +570,7 @@ export function ResultsGrid({
                   if (e.key === "Enter") {
                     if (editValue !== String(val ?? "") && onCellChange && editingEnabled) {
                       onCellChange({
-                        rowIndex: row.index,
+                        rowIndex: sourceIndex,
                         columnId: column.id,
                         originalValue: val,
                         newValue: editValue,
@@ -435,7 +583,7 @@ export function ResultsGrid({
                 onBlur={() => {
                   if (editValue !== String(val ?? "") && onCellChange && editingEnabled) {
                     onCellChange({
-                      rowIndex: row.index,
+                      rowIndex: sourceIndex,
                       columnId: column.id,
                       originalValue: val,
                       newValue: editValue,
@@ -450,13 +598,17 @@ export function ResultsGrid({
 
         // Apply masking if enabled
         const sensitivePattern = sensitiveColumns.get(column.id);
-        const cellKey = `${row.index}:${column.id}`;
+        // Addressed through the map for the same reason a pending change is: a reveal
+        // keyed by the filtered position was handed to whichever row later sat there, so
+        // changing a filter inside the 10s window put another row's sensitive value on
+        // screen unmasked.
+        const cellKey = `${sourceIndex}:${column.id}`;
         const isRevealed = revealedCells.has(cellKey);
-        const { value: displayValue, isMasked } = getDisplayedCellValue(row.index, row.original, column.id);
+        const { value: displayValue, isMasked } = getDisplayedCellValue(sourceIndex, row.original, column.id);
 
         if (isMasked) {
           return (
-            <div className="truncate w-full h-full flex items-center gap-1 group/cell">
+            <div className={cn("w-full flex gap-1 group/cell", valueFlow, wrapText ? "items-start" : "items-center")}>
               <span className="text-fg-muted italic">{String(displayValue)}</span>
               {userCanReveal && (
                 <button
@@ -478,7 +630,7 @@ export function ResultsGrid({
         if (effectiveMaskingEnabled && sensitivePattern && isRevealed) {
           const { display, className } = formatCellValue(displayValue);
           return (
-            <div className="truncate w-full h-full flex items-center gap-1">
+            <div className={cn("w-full flex gap-1", valueFlow, wrapText ? "items-start" : "items-center")}>
               <span className={className}>{display}</span>
               <Lock strokeWidth={1.5} className="w-2.5 h-2.5 text-hue-purple/50 shrink-0" />
             </div>
@@ -494,7 +646,7 @@ export function ResultsGrid({
         // editing at all (issue #269).
         if (!editingEnabled) {
           return (
-            <div className={cn("truncate w-full h-full", pendingChange && "bg-warning-tint/10 rounded px-0.5")}>
+            <div className={cn("w-full", valueFlow, pendingChange && "bg-warning-tint/10 rounded px-0.5")}>
               <span className={cn(className, pendingChange && "text-warning")}>{display}</span>
             </div>
           );
@@ -502,7 +654,7 @@ export function ResultsGrid({
 
         return (
           <div
-            className={cn("truncate w-full h-full cursor-text", pendingChange && "bg-warning-tint/10 rounded px-0.5")}
+            className={cn("w-full cursor-text", valueFlow, pendingChange && "bg-warning-tint/10 rounded px-0.5")}
             onDoubleClick={() => {
               setEditingCell({ rowIndex: row.index, columnId: column.id });
               setEditValue(pendingChange ? pendingChange.newValue : String(val ?? ""));
@@ -516,7 +668,11 @@ export function ResultsGrid({
       minSize: 80,
       maxSize: 500,
     }));
+
+    return [detailColumn, ...fieldColumns];
   }, [
+    detailColumnId,
+    wrapText,
     result.fields,
     result.columnTypes,
     editingCell,
@@ -527,6 +683,7 @@ export function ResultsGrid({
     onCellChange,
     getCellChange,
     getDisplayedCellValue,
+    resolveSourceIndex,
     columnFilters,
     activeFilterCol,
     revealedCells,
@@ -534,14 +691,45 @@ export function ResultsGrid({
     revealCell,
   ]);
 
+  /**
+   * The hidden fields, for the strip. `false` is hidden and anything else is visible,
+   * which is TanStack's convention and the reason this is derived here rather than in
+   * the strip: the strip asks "which are hidden", not "what does the table store".
+   */
+  const hiddenColumns = useMemo(
+    () => new Set(Object.keys(columnVisibility).filter((field) => columnVisibility[field] === false)),
+    [columnVisibility],
+  );
+
+  /**
+   * The fields every view that does NOT go through the table instance renders (#870).
+   *
+   * Three readers: the mobile table's header and body loops, which map fields directly,
+   * and the card view, which picks its preview fields from the list it is handed. All
+   * three used `result.fields`, so column visibility reached the desktop grid alone and
+   * one hidden column meant two different answers on one result depending on the
+   * breakpoint or the view toggle. They read this instead, which also makes the
+   * sticky-first-column rule at `idx === 0` follow the first column that is there.
+   */
+  const visibleFields = useMemo(
+    () => result.fields.filter((field) => !hiddenColumns.has(field)),
+    [result.fields, hiddenColumns],
+  );
+
+  const toggleColumn = useCallback((field: string) => {
+    setColumnVisibility((current) => ({ ...current, [field]: current[field] === false }));
+  }, []);
+
   const table = useTable({
     features: tableFeatureSet,
     data: filteredRows,
     columns,
     state: {
       sorting,
+      columnVisibility,
     },
     onSortingChange: setSorting,
+    onColumnVisibilityChange: setColumnVisibility,
     columnResizeMode: "onChange",
   });
 
@@ -578,6 +766,35 @@ export function ResultsGrid({
     overscan: 5,
   });
 
+  /**
+   * THE PAGE-TWO OFFER, or undefined where there is none (#816).
+   *
+   * One value rather than the same three-way conjunction written out at each use, and
+   * that is the whole point: the control and the ordering notice below are two statements
+   * about the SAME offer, and written separately they drift. The notice is the one that
+   * goes wrong quietly — an auto-limited unordered result that fits in a single page
+   * announces that order across pages is not guaranteed, beside no control, about a page
+   * that does not exist.
+   *
+   * `pageOfferFor` and not an inline conjunction because the export dialog asks the same
+   * question one layer up (`src/lib/export/scope.ts`), about the same rows.
+   */
+  const pageOffer = pageOfferFor(result.pagination, supportsResultPagination, onLoadMore);
+
+  /**
+   * Whether to state, once, that order across pages is not guaranteed.
+   *
+   * Studio will not inject, require or suggest an `ORDER BY` to paginate: on a table of
+   * millions of rows a sort can be fatal, and paying for it is the user's call. Without
+   * one the engine may return rows that repeat or are skipped between pages. That is
+   * accepted, not blocked — but it must not pretend to be the ordered case.
+   *
+   * Unknown statement, no claim: with no `resultQuery` the surface cannot read the order,
+   * and staying quiet is the guess that does not reassure.
+   */
+  const orderAcrossPagesUnspecified =
+    pageOffer !== undefined && resultQuery !== undefined && !hasResultOrder(resultQuery, databaseType);
+
   if (!result || result.rows.length === 0) {
     // A warning here is the whole story: an engine can answer 200 with every
     // segment unavailable, and the stats bar that normally carries the badge is
@@ -613,6 +830,14 @@ export function ResultsGrid({
         onClearFilters={handleClearFilters}
         viewMode={viewMode}
         onSetViewMode={handleSetViewMode}
+        wrapText={wrapText}
+        onToggleWrapText={() => {
+          // Both virtualizers cache every row they measured. Dropping the cache on each
+          // toggle is what lets rows grown while wrapping shrink back once it is off.
+          rowVirtualizer.measure();
+          mobileTableVirtualizer.measure();
+          setWrapText((value) => !value);
+        }}
         hasSensitive={hasSensitive}
         effectiveMaskingEnabled={effectiveMaskingEnabled}
         userCanToggle={userCanToggle}
@@ -621,6 +846,11 @@ export function ResultsGrid({
         pendingChanges={pendingChanges}
         onApplyChanges={onApplyChanges}
         onDiscardChanges={onDiscardChanges}
+        orderAcrossPagesUnspecified={orderAcrossPagesUnspecified}
+        pageOffer={pageOffer}
+        isLoadingMore={isLoadingMore}
+        hiddenColumns={hiddenColumns}
+        onToggleColumn={toggleColumn}
       />
 
       <div ref={cardContainerRef} className={cn("flex-1 overflow-auto p-4 md:hidden", viewMode !== "card" && "hidden")}>
@@ -642,7 +872,7 @@ export function ResultsGrid({
                 >
                   <ResultCard
                     row={result.rows[virtualRow.index]}
-                    fields={result.fields}
+                    fields={visibleFields}
                     primaryColumn={primaryColumn}
                     idColumn={idColumn}
                     index={virtualRow.index}
@@ -664,7 +894,7 @@ export function ResultsGrid({
       >
         <div className="min-w-max">
           <div className="sticky top-0 z-20 bg-raised flex">
-            {result.fields.map((field, idx) => {
+            {visibleFields.map((field, idx) => {
               const isSensitive = effectiveMaskingEnabled && sensitiveColumns.has(field);
               const declaredType = declaredTypeOf(result.columnTypes, field);
               return (
@@ -705,21 +935,23 @@ export function ResultsGrid({
                   <ContextMenuTrigger asChild>
                     <button
                       type="button"
+                      data-index={virtualRow.index}
                       style={{
                         position: "absolute",
                         top: 0,
                         left: 0,
                         right: 0,
-                        height: `${virtualRow.size}px`,
+                        ...(wrapText ? { minHeight: "48px" } : { height: `${virtualRow.size}px` }),
                         transform: `translateY(${virtualRow.start}px)`,
                       }}
+                      ref={wrapText ? mobileTableVirtualizer.measureElement : undefined}
                       className="flex hover:bg-brand-tint/[0.03] transition-colors border-b border-hairline cursor-pointer text-left"
                       onClick={() => setSelectedRow({ row, index: virtualRow.index })}
                       onContextMenu={(event) => {
                         if (event.target === event.currentTarget) setContextCell(null);
                       }}
                     >
-                      {result.fields.map((field, idx) => {
+                      {visibleFields.map((field, idx) => {
                         const { value: cellValue, isMasked } = getDisplayedCellValue(virtualRow.index, row, field);
                         const { display: displayValue, className: formattedClassName } = formatCellValue(cellValue);
                         const className = isMasked ? "text-fg-muted italic" : formattedClassName;
@@ -728,9 +960,11 @@ export function ResultsGrid({
                           <div
                             key={field}
                             className={cn(
-                              "h-full px-4 py-3 border-r border-hairline text-xs font-mono whitespace-nowrap overflow-hidden flex items-center",
+                              "px-4 py-3 border-r border-hairline text-xs font-mono overflow-hidden flex min-w-[120px]",
+                              wrapText
+                                ? "whitespace-pre-wrap break-words items-start"
+                                : "h-full whitespace-nowrap items-center",
                               idx === 0 && "sticky left-0 z-10 bg-sunken shadow-[2px_0_8px_rgba(0,0,0,0.3)]",
-                              "min-w-[120px]",
                             )}
                             onContextMenu={() => setContextCell({ rowIndex: virtualRow.index, field })}
                           >
@@ -748,42 +982,61 @@ export function ResultsGrid({
         </div>
       </div>
 
-      <div ref={tableContainerRef} className="hidden md:block flex-1 overflow-auto editor-scrollbar">
+      <div
+        ref={tableContainerRef}
+        data-desktop-grid=""
+        className="hidden md:block flex-1 overflow-auto editor-scrollbar"
+      >
         <div className="min-w-max">
           <div className="sticky top-0 z-20 bg-raised flex">
             {table.getHeaderGroups().map((headerGroup) =>
-              headerGroup.headers.map((header) => (
-                <div
-                  key={header.id}
-                  style={{ width: header.getSize(), minWidth: header.getSize() }}
-                  className="h-10 px-4 flex items-center border-r border-b border-hairline text-xs uppercase font-mono text-fg-muted bg-raised relative group shrink-0"
-                >
-                  {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
-
+              headerGroup.headers.map((header) => {
+                const isRowDetail = header.column.id === detailColumnId;
+                return (
                   <div
-                    aria-hidden="true"
-                    onMouseDown={header.getResizeHandler()}
-                    onTouchStart={header.getResizeHandler()}
+                    key={header.id}
+                    {...(isRowDetail ? { "data-row-detail-header": "" } : {})}
+                    style={{ width: header.getSize(), minWidth: header.getSize() }}
                     className={cn(
-                      "absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-brand-tint/50 transition-colors",
-                      header.column.getIsResizing() ? "bg-brand-tint w-1" : "bg-transparent",
+                      "h-10 flex items-center border-r border-b border-hairline text-xs uppercase font-mono text-fg-muted bg-raised relative group shrink-0",
+                      isRowDetail ? "px-2 justify-center sticky left-0 z-10" : "px-4",
                     )}
-                  />
-                </div>
-              )),
+                  >
+                    {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
+
+                    {/* A column pinned to one width has no handle to drag: rendering one
+                        would offer a drag that `enableResizing: false` then refuses. */}
+                    {header.column.getCanResize() && (
+                      <div
+                        aria-hidden="true"
+                        onMouseDown={header.getResizeHandler()}
+                        onTouchStart={header.getResizeHandler()}
+                        className={cn(
+                          "absolute right-0 top-0 h-full w-1 cursor-col-resize hover:bg-brand-tint/50 transition-colors",
+                          header.column.getIsResizing() ? "bg-brand-tint w-1" : "bg-transparent",
+                        )}
+                      />
+                    )}
+                  </div>
+                );
+              }),
             )}
           </div>
 
           <div style={{ height: `${rowVirtualizer.getTotalSize()}px`, position: "relative" }}>
             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
               const row = rows[virtualRow.index];
+              const sourceIndex = resolveSourceIndex(row.original, row.index);
               return (
                 <ContextMenu key={row.id}>
                   <ContextMenuTrigger asChild>
                     <div
                       data-index={virtualRow.index}
+                      ref={wrapText ? rowVirtualizer.measureElement : undefined}
                       style={{
-                        height: `${virtualRow.size}px`,
+                        // A fixed height is all measureElement would ever read back, so a
+                        // wrapping row sizes to its content and reports that instead.
+                        ...(wrapText ? { minHeight: "36px" } : { height: `${virtualRow.size}px` }),
                         transform: `translateY(${virtualRow.start}px)`,
                         position: "absolute",
                         top: 0,
@@ -794,29 +1047,40 @@ export function ResultsGrid({
                         if (event.target === event.currentTarget) setContextCell(null);
                       }}
                     >
-                      {row.getVisibleCells().map((cell) => (
-                        <div
-                          key={cell.id}
-                          style={{ width: cell.column.getSize(), minWidth: cell.column.getSize() }}
-                          className="h-full px-4 py-2 border-r border-hairline text-xs font-mono whitespace-nowrap overflow-hidden group-hover:border-hairline-strong flex items-center shrink-0"
-                          onContextMenu={() => setContextCell({ rowIndex: row.index, field: cell.column.id })}
-                        >
-                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                        </div>
-                      ))}
+                      {row.getVisibleCells().map((cell) => {
+                        const isRowDetail = cell.column.id === detailColumnId;
+                        return (
+                          <div
+                            key={cell.id}
+                            style={{ width: cell.column.getSize(), minWidth: cell.column.getSize() }}
+                            className={cn(
+                              "py-2 border-r border-hairline text-xs font-mono overflow-hidden group-hover:border-hairline-strong flex shrink-0",
+                              wrapText
+                                ? "whitespace-pre-wrap break-words items-start"
+                                : "h-full whitespace-nowrap items-center",
+                              // Sticky with the header above it, so the control is still
+                              // there once a wide result has been scrolled sideways.
+                              isRowDetail ? "px-1 justify-center sticky left-0 z-10 bg-sunken" : "px-4",
+                            )}
+                            // The detail control is not a value, so right-clicking it offers
+                            // the row and nothing to copy out of that column.
+                            onContextMenu={() =>
+                              setContextCell(isRowDetail ? null : { rowIndex: sourceIndex, field: cell.column.id })
+                            }
+                          >
+                            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                          </div>
+                        );
+                      })}
                     </div>
                   </ContextMenuTrigger>
-                  {renderCopyMenu(row.original, row.index)}
+                  {renderCopyMenu(row.original, sourceIndex)}
                 </ContextMenu>
               );
             })}
           </div>
         </div>
       </div>
-
-      {result.pagination?.hasMore && onLoadMore && (
-        <LoadMoreFooter hasMore={true} onLoadMore={onLoadMore} isLoadingMore={isLoadingMore} />
-      )}
 
       {selectedRow && (
         <RowDetailSheet

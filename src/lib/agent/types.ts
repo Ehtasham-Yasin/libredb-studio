@@ -46,7 +46,8 @@ import type { LLMProviderType } from "@/lib/llm/types";
 
 import type { PolicyDenyCode } from "@/lib/db/operations/policy";
 import type { AgentStatementViolation } from "@/lib/db/operations/statement-guard";
-import type { AgentChartSpec, DatabaseType, TableSchema } from "@/lib/types";
+import type { AgentChartSpec, ColumnSchema, DatabaseType, ForeignKeySchema, IndexSchema } from "@/lib/types";
+import type { ObjectRole } from "@/lib/db/types";
 import type { AgentContextCharge, AgentContextRowBudget, AgentContextUnavailableCode } from "./context-snapshot";
 import type { AgentGoalShortfall, AgentGoalVerifierId } from "./goal-verifier";
 import type { AgentToolName } from "./tools";
@@ -368,6 +369,22 @@ export type AgentRunFailureReason =
    * already carried the distinction; this is where it becomes visible.
    */
   | "agent-credential-unusable"
+  /**
+   * The database principal this run would have executed as was refused by the
+   * read-only execution profile itself. The engine IS supported and the credential
+   * WAS applied: what failed is the user it names.
+   *
+   * Split out of `engine-unsupported` the same way and for the same reason B47 split
+   * `agent-credential-unusable` out of it. `PROFILE_PRIVILEGES_TOO_BROAD` is raised by
+   * PostgreSQL for a superuser and by SQL Server for a principal that is unverified or
+   * too broad, and SQL Server raises it a second way, for a principal that cannot ask
+   * for the plan its admission step compiles. Folded into the engine reason, every one
+   * of those told the user to investigate a different connection while the fix was one
+   * GRANT: measured on the SQL Server fixture, where `sa`, the only credential this
+   * repository's own `database-compose.yml` ships, is refused by the profile, and the
+   * least-privilege `libredb_agent` principal beside it is accepted.
+   */
+  | "agent-principal-refused"
   /** The run's persisted connection no longer resolves on the server. */
   | "connection-unresolvable"
   /** Anything else. Deliberately unspecific; the log carries the detail. */
@@ -474,19 +491,130 @@ export interface AgentReportClaim {
 export type { AgentChartSpec } from "@/lib/types";
 
 /**
+ * One entry of the inventory a run reasons over (#789).
+ *
+ * It was declared for a while as the old flat schema element widened with the facts that
+ * shape could not carry, which is what let the agent consumers move one at a time; they
+ * have all moved, so it declares its own fields and nothing in this tree names the flat
+ * type any more. The fields are the same ones, spelled `readonly`: an inventory is a
+ * READING, and a consumer that sorted or spliced an entry's columns in place was rewriting
+ * what the model had already been shown.
+ *
+ * `kind` is the whole point of the widening. An entry with no kind was handed to a model
+ * under whatever noun the engine's labels supplied, so a view arrived under the word
+ * "table" and a run drafted an `INSERT` against it, which is the class #414 measured on
+ * Redis. Absent means the object surface did not answer for this entry, and absent is
+ * rendered as nothing at all rather than as "table": a missing fact must not be filled in
+ * with the most common value.
+ *
+ * `path` ADDRESSES the object and `name` LABELS it, the same split `DatabaseObject`
+ * records. It is optional for exactly one reason: an entry read through the flat schema
+ * surface has a qualified NAME and no segments, and no reader may split that name to
+ * invent them. A table literally called `a.b` in `public` is why.
+ */
+export interface AgentInventoryObject {
+  /** The ADDRESS a statement can be written against, qualified wherever segments were read. */
+  readonly name: string;
+  readonly columns: readonly ColumnSchema[];
+  readonly indexes: readonly IndexSchema[];
+  /** Absent where the reading carries no relations at all, which is not the same as none. */
+  readonly foreignKeys?: readonly ForeignKeySchema[];
+  /** Only where the engine counts, and never a number this server derived. */
+  readonly rowCount?: number;
+  /** The engine's own rendering of the object's size, where it publishes one. */
+  readonly size?: string;
+  /** The object's segments, when the object surface supplied it. Never split from `name`. */
+  readonly path?: readonly string[];
+  /** The declared kind id this object was listed under, when one is known. */
+  readonly kind?: string;
+  /**
+   * The engine's own display label, present only where it differs from `name`.
+   *
+   * `name` is the ADDRESS a statement can be written against, qualified wherever the
+   * object surface supplied segments, because four consumers resolve a model's spelling
+   * against it: `planTableProfile` reads a bare name as an unqualified target and lets the
+   * engine's search path choose the relation (#345), and `er-diagram.ts` compares it to
+   * still-qualified foreign key targets. Ruling 2 of #789 lets the two differ - a
+   * PostgreSQL routine's last path segment carries its overload form while its label is
+   * the bare name - so the label is carried beside the address rather than instead of it.
+   */
+  readonly label?: string;
+}
+
+/**
+ * A kind the engine declared, as the run's prose needs it.
+ *
+ * The `ObjectKindSpec` fields a renderer needs, plus the two facts that decide whether
+ * what the model is told about this kind is TRUE, neither of which lives on the spec:
+ *
+ *  - `sampledFrom` is the provider's own sentence from `KindCount`'s fourth state, and its
+ *    presence means every count and every listing of this kind is a FLOOR. Redis counts
+ *    its key groupings from a bounded `SCAN` and LibreDB its keyspaces from a bounded key
+ *    walk; a run told "17 key patterns" over either has been handed a sample as a
+ *    population, which is #414 in one number.
+ *  - `derivedGroupings` says the rows of this kind are prefix groupings this SERVER
+ *    derived, not objects anybody named, so no command can be given such a name. It is
+ *    `ProviderCapabilities.tablesAreDerivedGroupings`, which is still the flag that
+ *    carries the refusal (`src/components/object-tree/row-actions.ts` reads the same one),
+ *    resolved to a boolean at the edge and attached to the relation kinds it is about.
+ */
+export interface AgentInventoryKind {
+  readonly id: string;
+  readonly role: ObjectRole;
+  /** The engine's own word, singular, rendered as-is: "Table", "Key Pattern". */
+  readonly label: string;
+  readonly labelPlural: string;
+  /** What a bounded read of this kind was counted from. Present means every number is a floor. */
+  readonly sampledFrom?: string;
+  /** These rows are groupings this server derived; nothing can be addressed by such a name. */
+  readonly derivedGroupings?: boolean;
+}
+
+/**
+ * The inventory itself: what was read, what the kinds MEAN, and whether it is all of it.
+ *
+ * `truncated` is the field that stops an absence being read as an absence in the database.
+ * The bulk inventory route bounds both the number of listings it issues and the number of
+ * objects it returns, and a saturated slice handed over as a complete inventory makes its
+ * reader treat a missing table as one that does not exist. It carries the same shape the
+ * route reports (`src/lib/api/object-route.ts`), so there is one incompleteness shape in
+ * the product rather than two.
+ */
+export interface AgentInventory {
+  readonly objects: readonly AgentInventoryObject[];
+  /**
+   * The kinds the objects were listed under.
+   *
+   * Optional, and absent means the same thing an empty list does: nothing here is kinded,
+   * so no renderer may name a kind. It is optional because a snapshot recorded in a run's
+   * ledger before this field existed still has to be READABLE: `reusableSnapshot` re-reads
+   * such an entry rather than trusting it, and it must be able to parse it to decide that.
+   */
+  readonly kinds?: readonly AgentInventoryKind[];
+  /** Present only where a bound actually bit. Absent is a claim of completeness. */
+  readonly truncated?: { readonly limit: number; readonly reason: string };
+  /**
+   * The container the session is IN, where the reading that produced this knew it (#789).
+   *
+   * It is the tie-breaker for every consumer of the address rule, and it is carried on the
+   * inventory because the fact is read once, by the container walk, and needed later by a
+   * tool: `profile_table` resolved with no preferred container and refused a spelling the
+   * object browser resolves, in the same run, off the same two objects. Absent where the
+   * engine has no containers or marked no level `isSessionDefault`, and absent is not a
+   * default to invent: a tie with nothing to break it is refused, not guessed.
+   */
+  readonly defaultContainer?: readonly string[];
+}
+
+/**
  * The schema inventory a run reasons over, plus the fingerprint that decides
  * whether a refresh has to read anything at all.
- *
- * `tables` reuses the shipped `TableSchema` shape rather than introducing a
- * second schema vocabulary: the providers already produce it, the UI already
- * renders it, and it is serializable as it stands.
  */
-export interface AgentContextSnapshot {
+export interface AgentContextSnapshot extends AgentInventory {
   readonly connectionId: string;
   /** Stable across two identical inventories; changes when the inventory does. */
   readonly fingerprint: string;
   readonly capturedAtMs: number;
-  readonly tables: readonly TableSchema[];
   /**
    * WHICH of the two readings produced this inventory (#414).
    *
@@ -517,9 +645,11 @@ export interface AgentContextSnapshot {
  * said nothing happened would contradict the ledger.
  *
  * The grounding schema read (#414) adds no third code. A provider that cannot describe
- * itself is not a state that exists — `getSchema()` is required on `DatabaseProvider`
- * — and the reachable failure, a `getSchema()` that rejects, is a database error the
- * reading path already reports as one.
+ * itself is not a state that exists — the four object-surface methods are required on
+ * `DatabaseProvider` (#789) — and the reachable failure, one of them rejecting, is a
+ * database error the reading path already reports as one. The declaration-shaped
+ * absence, an engine with no `objectKinds`, is answered before anything is charged, so
+ * it never reaches a settlement either.
  */
 export type AgentReadingDenyCode = "KIND_UNSUPPORTED_BY_PROVIDER" | "READING_OVER_BUDGET";
 
@@ -1488,4 +1618,48 @@ export interface AgentRunRecord {
   readonly updatedAtMs: number;
   /** The run's ledger, in order. The only history there is. */
   readonly events: readonly AgentRunEvent[];
+}
+
+/**
+ * One step of a finished conversation, as the history surface needs it.
+ *
+ * Carried by `AgentConversationSummary` rather than by the run record itself: a
+ * conversation's steps are separate runs, each with its own ledger, and the history
+ * surface needs one projection of them it can list without reading N ledgers.
+ *
+ * Inert by construction, like every contract here: identifiers, enumerated strings
+ * and numbers. It is what `src/lib/agent/history.ts` folds out of the history index
+ * stream, and the route returns it to the owner verbatim.
+ */
+export interface AgentConversationStep {
+  readonly runId: string;
+  readonly objective: string;
+  readonly workflowType: AgentRunWorkflowType;
+  readonly mode: AgentRunMode;
+  readonly status: AgentRunTerminalStatus;
+  /**
+   * Whether the run ANSWERED, in the verifier's own verdict — `null` when no verdict
+   * exists, which is the case for a run that never entered the loop (it ended before
+   * it began, so there is nothing to judge).
+   */
+  readonly answered: boolean | null;
+  /** The connection the step was opened on; single-connection by thread induction. */
+  readonly connectionId: string;
+  readonly createdAtMs: number;
+  /** When the step finished, not when it was opened. */
+  readonly updatedAtMs: number;
+}
+
+/**
+ * One finished conversation, whole: every step that belongs to it, oldest first.
+ *
+ * The steps are the conversation — the thread is a linked list in the run headers,
+ * and the history index records the same links as a flat, append-only stream. This
+ * shape carries no derived "latest" fields, because a derived figure beside the
+ * components it was derived from is two answers to one question and they can
+ * disagree; the latest step is `steps.at(-1)`.
+ */
+export interface AgentConversationSummary {
+  readonly threadId: string;
+  readonly steps: readonly AgentConversationStep[];
 }

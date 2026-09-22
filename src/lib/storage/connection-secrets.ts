@@ -44,10 +44,18 @@ export const CONNECTION_FIELDS: Record<keyof DatabaseConnection, FieldClass> = {
   authSource: "public",
   schema: "public",
   queryTimeout: "public",
+  // A display preference: whether this browser reads the catalog when the connection
+  // opens. It grants nothing and unlocks nothing.
+  skipObjectScan: "public",
   managed: "public",
   seedId: "public",
   agentUser: "public",
   agentPassword: "secret",
+  // Not `user`'s twin. `user` is a name an operator chose and can re-type; this is one
+  // generated, opaque half of a credential pair, so leaving it readable narrows what a
+  // leak has to guess from two values to one. See the field's own doc in types.ts.
+  apiKeyId: "secret",
+  apiKeySecret: "secret",
 };
 
 export const SSL_FIELDS: Record<keyof SSLConfig, FieldClass> = {
@@ -210,7 +218,7 @@ export interface ConnectionReadResult {
 /**
  * Every read goes through this. An unreadable field is OMITTED and the record kept:
  *
- * - Throwing would empty all ten collections for a rotated key, taking the user's query history,
+ * - Throwing would empty all twelve collections for a rotated key, taking the user's query history,
  *   saved queries, charts and snapshots down with the passwords.
  * - Dropping the record would be worse. useStorageSync is a write-through cache, so a connection
  *   missing from a read is persisted as a deletion on the next push - destroying ciphertext that a

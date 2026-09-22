@@ -20,22 +20,22 @@ mock.module("framer-motion", () => ({
 // ── Imports after mocks ─────────────────────────────────────────────────────
 
 import { ColumnList } from "@/components/schema-explorer/ColumnList";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 
 // ── Test data ───────────────────────────────────────────────────────────────
 
-const columnsWithPrimary: TableSchema["columns"] = [
+const columnsWithPrimary: DetailedObject["columns"] = [
   { name: "id", type: "SERIAL", nullable: false, isPrimary: true },
   { name: "email", type: "VARCHAR(255)", nullable: true, isPrimary: false },
   { name: "created_at", type: "timestamp", nullable: false, isPrimary: false },
 ];
 
-const columnsNoPrimary: TableSchema["columns"] = [
+const columnsNoPrimary: DetailedObject["columns"] = [
   { name: "key", type: "TEXT", nullable: false, isPrimary: false },
   { name: "value", type: "JSONB", nullable: true, isPrimary: false },
 ];
 
-const indexesSample: TableSchema["indexes"] = [
+const indexesSample: DetailedObject["indexes"] = [
   { name: "idx_email", columns: ["email"], unique: true },
   { name: "idx_created", columns: ["created_at"], unique: false },
 ];
@@ -67,6 +67,27 @@ describe("ColumnList", () => {
   test("does not render full type with params", () => {
     const { queryByText } = render(<ColumnList columns={columnsWithPrimary} indexes={[]} />);
     expect(queryByText("VARCHAR(255)")).toBeNull();
+  });
+
+  test("a long type name does not push the column name to zero width", () => {
+    const columns: DetailedObject["columns"] = [
+      { name: "created_at", type: "timestamp without time zone", nullable: false, isPrimary: false },
+    ];
+    const { queryByText } = render(<ColumnList columns={columns} indexes={[]} />);
+    const typeEl = queryByText("timestamp without time zone");
+    expect(typeEl).not.toBeNull();
+    // The name span keeps flex-1 (grows into the space the type span gives up).
+    const nameEl = queryByText("created_at");
+    expect(nameEl).not.toBeNull();
+    expect(nameEl!.className).toContain("flex-1");
+    // The type span truncates instead of forcing the name out: shrink-0 plus a
+    // capped, truncating width, with the full type available on hover. The cap
+    // is the class actually doing the work: dropping it (or widening it enough)
+    // leaves shrink-0/truncate in place but the name is pushed to zero width again.
+    expect(typeEl!.className).toContain("shrink-0");
+    expect(typeEl!.className).toContain("max-w-[40%]");
+    expect(typeEl!.className).toContain("truncate");
+    expect(typeEl!.getAttribute("title")).toBe("timestamp without time zone");
   });
 
   // ── Primary key indicator ───────────────────────────────────────────────
@@ -121,7 +142,7 @@ describe("ColumnList", () => {
   });
 
   test("handles columns with simple types (no parens)", () => {
-    const columns: TableSchema["columns"] = [{ name: "active", type: "boolean", nullable: false, isPrimary: false }];
+    const columns: DetailedObject["columns"] = [{ name: "active", type: "boolean", nullable: false, isPrimary: false }];
     const { queryByText } = render(<ColumnList columns={columns} indexes={[]} />);
     expect(queryByText("boolean")).not.toBeNull();
   });

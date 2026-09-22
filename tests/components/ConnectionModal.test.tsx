@@ -129,6 +129,9 @@ const mockHandlePasteConnectionString = mock(() => {});
 
 const mockSetLocalDataCenter = mock(() => {});
 const mockSetAuthSource = mock(() => {});
+const mockSetApiKeyId = mock(() => {});
+const mockSetApiKeySecret = mock(() => {});
+const mockSetSkipObjectScan = mock(() => {});
 
 let mockFormOverrides: Record<string, unknown> = {};
 
@@ -140,6 +143,8 @@ function getDefaultForm() {
     setName: mockSetName,
     queryTimeout: "",
     setQueryTimeout: mockSetQueryTimeout,
+    skipObjectScan: false,
+    setSkipObjectScan: mockSetSkipObjectScan,
     host: "localhost",
     setHost: mockSetHost,
     port: "5432",
@@ -186,6 +191,10 @@ function getDefaultForm() {
     setSchema: mock(() => {}),
     authSource: "",
     setAuthSource: mockSetAuthSource,
+    apiKeyId: "",
+    setApiKeyId: mockSetApiKeyId,
+    apiKeySecret: "",
+    setApiKeySecret: mockSetApiKeySecret,
     showSSH: false,
     setShowSSH: mockSetShowSSH,
     sshEnabled: false,
@@ -245,7 +254,7 @@ const MOCK_CONNECTION_FIELDS: Record<string, string[]> = {
   duckdb: ["database"],
   libsql: ["host", "port", "password", "connectionString"],
   druid: ["host", "port", "user", "password"],
-  elasticsearch: ["host", "port", "user", "password"],
+  elasticsearch: ["host", "port", "user", "password", "apiKeyId", "apiKeySecret"],
   opensearch: ["host", "port", "user", "password"],
 };
 const mockFields = (type: string): string[] =>
@@ -341,6 +350,25 @@ describe("ConnectionModal", () => {
     rerender(React.createElement(ConnectionModal, createDefaultProps()));
     fireEvent.change(input, { target: { value: "" } });
     expect(mockSetQueryTimeout).toHaveBeenCalledWith("");
+  });
+
+  // #765: the connection that holds tens of thousands of objects is the one that knows,
+  // so the choice is made here rather than in a global setting.
+  test("offers the no-scan choice with its consequence spelled out, and forwards it", () => {
+    const { getByLabelText, getByText } = render(React.createElement(ConnectionModal, createDefaultProps()));
+    const box = getByLabelText("Do not read the object list on connect") as HTMLInputElement;
+
+    expect(box.checked).toBe(false);
+    expect(getByText("The editor still works. The object panel offers a load action instead.")).toBeDefined();
+
+    fireEvent.click(box);
+    expect(mockSetSkipObjectScan).toHaveBeenCalledWith(true);
+  });
+
+  test("shows the saved no-scan choice when editing", () => {
+    mockFormOverrides = { isEditMode: true, skipObjectScan: true };
+    const { getByLabelText } = render(React.createElement(ConnectionModal, createDefaultProps()));
+    expect((getByLabelText("Do not read the object list on connect") as HTMLInputElement).checked).toBe(true);
   });
 
   test("shows the saved query timeout when editing", () => {
@@ -1013,6 +1041,41 @@ describe("ConnectionModal", () => {
     const { container } = render(React.createElement(ConnectionModal, props));
 
     expect(container.querySelector("#authSource")).toBeNull();
+  });
+
+  // ── 34e. Elasticsearch offers the API key pair (#708) ──────────────────────
+
+  test("Elasticsearch offers API key ID and secret fields", () => {
+    mockFormOverrides = { type: "elasticsearch" };
+    const props = createDefaultProps();
+    const { container, queryByText } = render(React.createElement(ConnectionModal, props));
+
+    expect(container.querySelector("#apiKeyId")).not.toBeNull();
+    expect(container.querySelector("#apiKeySecret")).not.toBeNull();
+    expect(queryByText(/Beats/)).not.toBeNull();
+  });
+
+  test("editing the API key pair reaches the form state", () => {
+    mockFormOverrides = { type: "elasticsearch" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    fireEvent.change(container.querySelector("#apiKeyId") as HTMLInputElement, { target: { value: "seed-key-id" } });
+    fireEvent.change(container.querySelector("#apiKeySecret") as HTMLInputElement, {
+      target: { value: "seed-key-secret" },
+    });
+
+    expect(mockSetApiKeyId).toHaveBeenCalledWith("seed-key-id");
+    expect(mockSetApiKeySecret).toHaveBeenCalledWith("seed-key-secret");
+  });
+
+  test("OpenSearch does not offer the API key pair", () => {
+    mockFormOverrides = { type: "opensearch" };
+    const props = createDefaultProps();
+    const { container } = render(React.createElement(ConnectionModal, props));
+
+    expect(container.querySelector("#apiKeyId")).toBeNull();
+    expect(container.querySelector("#apiKeySecret")).toBeNull();
   });
 
   // ── 35. Browser autofill stays out of the credential fields ───────────────

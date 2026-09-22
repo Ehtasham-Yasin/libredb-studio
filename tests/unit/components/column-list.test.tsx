@@ -2,41 +2,41 @@ import { describe, test, expect } from "bun:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ColumnList } from "@/components/schema-explorer/ColumnList";
-import type { TableSchema } from "@/lib/types";
+import type { DetailedObject } from "@/lib/db/detailed-object";
 
 // =============================================================================
 // Test Data
 // =============================================================================
 
-const primaryColumn: TableSchema["columns"][0] = {
+const primaryColumn: DetailedObject["columns"][0] = {
   name: "id",
   type: "integer",
   nullable: false,
   isPrimary: true,
 };
 
-const regularColumn: TableSchema["columns"][0] = {
+const regularColumn: DetailedObject["columns"][0] = {
   name: "email",
   type: "varchar(255)",
   nullable: false,
   isPrimary: false,
 };
 
-const nullableColumn: TableSchema["columns"][0] = {
+const nullableColumn: DetailedObject["columns"][0] = {
   name: "bio",
   type: "text",
   nullable: true,
   isPrimary: false,
 };
 
-const typedColumn: TableSchema["columns"][0] = {
+const typedColumn: DetailedObject["columns"][0] = {
   name: "price",
   type: "numeric(10,2)",
   nullable: false,
   isPrimary: false,
 };
 
-const indexes: TableSchema["indexes"] = [
+const indexes: DetailedObject["indexes"] = [
   { name: "users_pkey", columns: ["id"], unique: true },
   { name: "users_email_key", columns: ["email"], unique: true },
 ];
@@ -79,9 +79,11 @@ describe("ColumnList", () => {
   test("displays column type without size specification", () => {
     const html = renderToStaticMarkup(<ColumnList columns={[typedColumn]} indexes={[]} />);
 
-    // type.split('(')[0] should show 'numeric' not 'numeric(10,2)'
+    // type.split('(')[0] should show 'numeric' not 'numeric(10,2)' as visible
+    // text; the size still reaches the title attribute for hover.
     expect(html).toContain("numeric");
-    expect(html).not.toContain("10,2");
+    expect(html).toContain('title="numeric(10,2)"');
+    expect(html.replace(/title="[^"]*"/g, "")).not.toContain("10,2");
   });
 
   test("displays simple type as-is", () => {
@@ -160,7 +162,9 @@ describe("ColumnList", () => {
   test("strips varchar size from type display", () => {
     const html = renderToStaticMarkup(<ColumnList columns={[regularColumn]} indexes={[]} />);
 
+    // Visible text drops the size; the title attribute keeps it for hover.
     expect(html).toContain("varchar");
-    expect(html).not.toContain("255");
+    expect(html).toContain('title="varchar(255)"');
+    expect(html.replace(/title="[^"]*"/g, "")).not.toContain("255");
   });
 });

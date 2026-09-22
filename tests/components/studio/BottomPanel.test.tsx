@@ -211,6 +211,7 @@ function createDefaultProps(overrides: Partial<Record<string, unknown>> = {}) {
     onLoadMore: undefined,
     isLoadingMore: false,
     onExportResults: mock(() => {}),
+    onCopyResults: mock(() => {}),
     ...overrides,
   };
 }
@@ -334,6 +335,105 @@ describe("BottomPanel", () => {
     const grid = queryByTestId("resultsgrid");
     expect(grid).not.toBeNull();
     expect(grid!.textContent).toBe("ResultsGrid");
+  });
+
+  /**
+   * THE PAGINATION SEAM (#816).
+   *
+   * This panel is the single place where a provider's `supportsResultPagination`, the
+   * statement the rows came from and the dialect it is read under reach `ResultsGrid`,
+   * and both shells go through it: `Studio` and `StudioWorkspace` each render this
+   * component. Every other test in this change measures one side of the seam — the
+   * providers declare the flag, `ResultsGrid` gates on a prop it is handed, `StatsBar`
+   * renders an offer it is handed — and none of them can see the wiring between them.
+   *
+   * Measured: with `supportsResultPagination` replaced by a literal `false` at
+   * `BottomPanel.tsx:574` the whole suite stayed green, 18678 tests, because those lines
+   * execute either way and 100% line coverage cannot tell a right value from a wrong one.
+   * The Load More control could be dead on every engine, or offered on Cassandra, and
+   * nothing would say so. That is acceptance criteria 1 and 4, so they are asserted here.
+   */
+  describe("what the grid is told about paging these rows (#816)", () => {
+    const PAGED_RESULT = {
+      rows: [{ id: 1 }],
+      fields: ["id"],
+      rowCount: 1,
+      executionTime: 3,
+      pagination: { limit: 50, offset: 0, hasMore: true, totalReturned: 1, wasLimited: true },
+    };
+
+    function pagedProps(capabilities: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
+      return createDefaultProps({
+        mode: "results",
+        activeConnection: { id: "c1", name: "conn", type: "postgres", createdAt: new Date(0) },
+        metadata: { capabilities },
+        currentTab: {
+          id: "tab-1",
+          name: "Query 1",
+          query: "SELECT * FROM orders WHERE id > 5",
+          resultQuery: "SELECT * FROM orders",
+          result: PAGED_RESULT,
+          isExecuting: false,
+          type: "sql" as const,
+        },
+        onLoadMore: mock(() => {}),
+        ...overrides,
+      });
+    }
+
+    test("the flag the grid gates on is the provider's own", () => {
+      const props = pagedProps({ supportsResultPagination: true });
+      render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      expect(capturedResultsGridProps.supportsResultPagination).toBe(true);
+    });
+
+    test("a provider that cannot page hands down its false, not an absent flag", () => {
+      // Criterion 4. `false` and `undefined` render identically — the grid gates on
+      // `=== true` — so only reading the value back tells a provider that declared it
+      // cannot page from a panel that forgot to ask.
+      const props = pagedProps({ supportsResultPagination: false });
+      render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      expect(capturedResultsGridProps.supportsResultPagination).toBe(false);
+    });
+
+    test("the ordering notice is read from the statement THESE rows came from, in its dialect", () => {
+      // `resultQuery` and not `query`: the editor buffer is rewritten on every keystroke,
+      // and the condition being stated is about the rows on screen (#881's rule).
+      const props = pagedProps({ supportsResultPagination: true });
+      render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      expect(capturedResultsGridProps.resultQuery).toBe("SELECT * FROM orders");
+      expect(capturedResultsGridProps.databaseType).toBe("postgres");
+    });
+
+    /**
+     * The export dialog and the grid speak about the SAME offer.
+     *
+     * `hasMore` alone is not it. Since the preview cap left the SQL text, a 50-row table
+     * preview on Cassandra or Elasticsearch fills its bound exactly and the route answers
+     * `hasMore: true` — while those providers declare `supportsResultPagination: false`
+     * and the grid offers no control. The shortfall sentence would then tell the user to
+     * "load them first" about an action that exists nowhere in the product.
+     */
+    test.each([
+      [true, "More rows are still on the server — load them first to include them."],
+      [false, null],
+    ])("with paging %p the export dialog's shortfall follows the grid's offer", async (supported, shortfall) => {
+      const props = pagedProps({ supportsResultPagination: supported });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      const scope = within(document.body as HTMLElement).getByTestId("export-scope");
+
+      expect(capturedResultsGridProps.supportsResultPagination).toBe(supported);
+      if (shortfall === null) {
+        expect(scope.textContent).toBe("Writes all 1 row.");
+      } else {
+        expect(scope.textContent).toContain(shortfall);
+      }
+    });
   });
 
   test('History tab renders QueryHistory component when mode="history"', () => {
@@ -694,6 +794,10 @@ describe("BottomPanel", () => {
 
       expect(capturedResultsGridProps.editingEnabled).toBe(false);
       expect(capturedResultsGridProps.onLoadMore).toBeUndefined();
+      // And the ordering notice is withheld with the control: these rows are an agent
+      // run's, and the tab's own statement did not produce them, so naming it here would
+      // state a fact about the wrong statement (#816).
+      expect(capturedResultsGridProps.resultQuery).toBeUndefined();
     });
 
     // B34: the menu used to be hidden here, because the export serialized the tab's
@@ -833,6 +937,88 @@ describe("BottomPanel", () => {
 
       expect(queryByTestId("agent-provenance")).toBeNull();
       expect(capturedResultsGridProps.result).toEqual(TAB_RESULT);
+    });
+  });
+  /**
+   * Copying the result instead of saving it (#701).
+   *
+   * The same writers, the same scope line, a different destination. The menu offers
+   * every format it already offers as a file, because a format that is worth a file is
+   * worth a paste, and a menu that carried a subset would only raise the question of
+   * which subset.
+   */
+  describe("copy to clipboard", () => {
+    const COPY_RESULT = { rows: [{ id: 1 }], fields: ["id"], rowCount: 1, executionTime: 42 };
+
+    function copyProps(overrides: Record<string, unknown> = {}) {
+      return createDefaultProps({
+        mode: "results",
+        currentTab: {
+          id: "tab-1",
+          name: "Q",
+          query: "SELECT 1",
+          result: COPY_RESULT,
+          isExecuting: false,
+          type: "sql" as const,
+        },
+        ...overrides,
+      });
+    }
+
+    test.each([
+      ["Copy as CSV", "csv", undefined],
+      ["Copy as CSV (semicolon)", "csv", ";"],
+      ["Copy as CSV (tab)", "csv", "\t"],
+      ["Copy as JSON", "json", undefined],
+      ["Copy as SQL INSERT", "sql-insert", undefined],
+      ["Copy as DDL (CREATE TABLE)", "sql-ddl", undefined],
+    ])("%s asks for that format on the clipboard", async (label, format, delimiter) => {
+      const onCopyResults = mock(() => {});
+      const props = copyProps({ onCopyResults });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      await userEvent.click(within(document.body as HTMLElement).getByText(label));
+
+      // The delimiter is passed only where the entry has one: "CSV" means the
+      // writer's own default, and an explicit `undefined` would be a different call
+      // for the same choice.
+      if (delimiter === undefined) expect(onCopyResults).toHaveBeenCalledWith(format, null);
+      else expect(onCopyResults).toHaveBeenCalledWith(format, null, delimiter);
+    });
+
+    // The scope line says the file holds one page of rows, and a paste looks even more
+    // like a complete answer than a file does. So it is read before the copy items,
+    // not only before the export ones.
+    test("the scope line is stated above the copy items", async () => {
+      const props = copyProps();
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      const menu = within(document.body as HTMLElement);
+      const scope = menu.getByTestId("export-scope");
+      const copy = menu.getByText("Copy as JSON");
+
+      expect(scope.compareDocumentPosition(copy) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    test("a copy over a hydrated result carries the run it came from", async () => {
+      const onCopyResults = mock(() => {});
+      const artifact = {
+        runId: "arun_1",
+        correlationId: "corr_9",
+        operationId: "sql.query.read",
+        surface: "results",
+        result: COPY_RESULT,
+        explainPlan: null,
+      };
+      const props = copyProps({ onCopyResults, agentArtifact: artifact, onDismissAgentArtifact: mock(() => {}) });
+      const { getByText } = render(<BottomPanel {...(props as React.ComponentProps<typeof BottomPanel>)} />);
+
+      await userEvent.click(getByText("Export"));
+      await userEvent.click(within(document.body as HTMLElement).getByText("Copy as JSON"));
+
+      expect(onCopyResults).toHaveBeenCalledWith("json", artifact);
     });
   });
 });

@@ -28,19 +28,19 @@ None of it is a GitHub issue.
 **Sections**
 
 - [SQL statement reading](#sql-statement-reading) — S2–S6 · 4
-- [Drivers and connections](#drivers-and-connections) — D1–D51, U17 · 12
+- [Drivers and connections](#drivers-and-connections) — D1–D103, U17 · 48
 - [Value interpolation](#value-interpolation) — V1
-- [Row editing](#row-editing) — R1
-- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X12, U2–U21 · 6
+- [Row editing](#row-editing) — R1–R3 · 3
+- [Studio UI and query execution](#studio-ui-and-query-execution) — X2–X19, U2–U35 · 23
 - [Dependencies](#dependencies) — P1–P5 · 5
-- [Documentation](#documentation) — DOC3, DOC4 · 2
-- [Release pipeline](#release-pipeline) — REL1–REL3 · 3
+- [Documentation](#documentation) — DOC3–DOC4 · 2
+- [Release pipeline](#release-pipeline) — REL1–REL4 · 4
 - [Chart configuration surface](#chart-configuration-surface) — N1 · 1
-- [Security Phase 1 deferrals](#security-phase-1-deferrals) — H1–H8 · 2
+- [Security Phase 1 deferrals](#security-phase-1-deferrals) — H1–H12 · 3
 - [Security Phase 2 deferrals](#security-phase-2-deferrals) — C3–C11 · 7
 - [Security Phase 3 deferrals](#security-phase-3-deferrals) — K4
-- [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A5 · 4
-- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2–B75 · 21
+- [Agent M1 deferrals (#328)](#agent-m1-deferrals-328) — A1–A8 · 7
+- [Agent M2 deferrals (#329)](#agent-m2-deferrals-329) — B2–B82 · 24
 
 ---
 
@@ -209,6 +209,52 @@ digits intact, and every consumer of a numeric cell has been checked against the
 
 ---
 
+### D98. What the other five drivers hand back for a 64-bit integer, measured
+
+D18 names two engines that lose digits and three that keep them as strings. Which side the rest of
+the family falls on was never measured, and the gap read as the same defect, unrecorded, on five
+more engines. Measured 2026-09-19, each through the seam the product itself uses - the ClickHouse
+HTTP transport, the Cassandra driver transport, `openDuckDBClient`, `mssql` under the options
+`buildConfig` sets, and `oracledb` with the only settings `oracle.ts` applies
+(`OUT_FORMAT_OBJECT`, and no `fetchAsString` for a NUMBER) - over a table holding 9007199254740993
+beside its neighbour 9007199254740992:
+
+| Engine | Declared | What the driver hands over for 9007199254740993 |
+| --- | --- | --- |
+| Oracle AI Database 26ai Free 23.26.3.0.0, oracledb 6.10.0 | `NUMBER(19,0)` | `9007199254740992`, a JS number - the NEIGHBOURING row's key |
+| SQL Server 2022 CU27 (16.0.4295.3), mssql 12.7.2 | `bigint` | `"9007199254740993"`, a string |
+| the same | `numeric(38,0)` | `1.2345678901234568e+37`, a JS number |
+| DuckDB v1.5.5, @duckdb/node-api 1.5.5-r.4 | `BIGINT` | `"9007199254740993"`, a string |
+| ClickHouse 26.8.6.5 | `Int64` / `UInt64` | `"9007199254740993"` / `"18446744073709551615"`, strings |
+| Apache Cassandra 5.0.9, cassandra-driver 4.9.0 | `bigint` / `varint` | `"9007199254740993"`, strings |
+
+Three of the five hand every 64-bit integer back as its digits, and each by a deliberate setting
+rather than by luck: the ClickHouse transport sends `output_format_json_quote_64bit_integers=1` and
+its comment says what happens without it, DuckDB is read with `getRowObjectsJson()`, which prints
+BIGINT, HUGEINT and DECIMAL as decimal strings, and the Cassandra adapter stringifies `Long`,
+`Integer` and `BigDecimal` for fidelity. SQL Server loses nothing on `bigint` either - tedious hands
+one over as text of its own accord - and rounds only its decimal family. Oracle's `NUMBER` is the one integer key of the
+five that reaches the grid already wrong, and that is D18, not a sixth thing. What the rounding
+costs the row editor is now one case rather than two: a FRACTIONAL key out of a column declared
+`NUMBER`, `decimal`, `numeric` or `money` is refused before the engine is asked, because the
+declaration says the driver rounded it - `describeFraction` and `EXACT_DECIMAL_TYPE_NAMES` in
+`src/hooks/use-inline-editing.ts`, measured 2026-09-19 on Oracle 26ai Free and SQL Server 2022 CU27.
+The key whose digits round to a WHOLE number is still open, and that is R3.
+
+**What is new is that one sentence in the tree is false.** `docs/providers/mssql.md` §5.3 says
+`BIGINT`, `DECIMAL`/`NUMERIC` and `MONEY` "are surfaced as JavaScript `number`s and can **lose
+precision** beyond 2^53". §5.4 of the same document says the opposite about the first of them -
+"`BIGINT` and `DECIMAL` reach the browser as strings" - and the measurement agrees with §5.4 for
+`bigint` and with §5.3 for `numeric`. D18 repeats §5.3's reading in its own second paragraph. One
+driver described two ways in one document is how a defect SQL Server does not have came to be
+expected of it.
+
+**Done when:** `docs/providers/mssql.md` states what tedious really hands over for each of those
+four types, D18's `BIGINT` mention is corrected to match, and the three string-returning drivers are
+recorded where a reader meets them rather than re-derived by the next sweep.
+
+---
+
 ### D25. Couchbase turns an RBAC denial into a zero, which the absence rule now forbids
 
 Found 2026-08-25 by the audit D24 asked for. `degradeTo()`
@@ -232,9 +278,9 @@ role, not inferred from the code.
 
 Measured 2026-08-27 against `datafuselabs/databend:v1.2.925-patch-11` (issue #424, Phase 0).
 Databend replies `Prepare is not support in Databend` to mysql2's prepared protocol, and that one
-answer takes `getTables()`, `getSchema()`, `getActiveSessions()`, `getTableStats()`,
-`getIndexStats()` and `getStorageStats()` - the whole object browser and every statistics panel -
-while the editor keeps working.
+answer takes the object reads, `getActiveSessions()`, `getTableStats()`, `getIndexStats()` and
+`getStorageStats()` - the whole object browser and every statistics panel - while the editor keeps
+working.
 
 **The catalogs are there.** Asked with literal SQL on the same connection,
 `information_schema.tables` returns the true 3 and 2000 rows with `data_length` 124 and 49000, and
@@ -323,12 +369,12 @@ Found 2026-08-27 by the audit that closed the curated health projection's cap-as
 removed MySQL's fabricated "Performance schema not available" row; three providers still ship the
 same shape, in the same field:
 
-- `src/lib/db/providers/sql/postgres.ts:1239` - a database without `pg_stat_statements` answers
+- `src/lib/db/providers/sql/postgres.ts:1241` - a database without `pg_stat_statements` answers
   `[{ query: "pg_stat_statements extension not enabled", calls: 0, avgTime: "N/A" }]`.
-- `src/lib/db/providers/document/mongodb.ts:791` - a database whose profiler is off answers
+- `src/lib/db/providers/document/mongodb.ts:785` - a database whose profiler is off answers
   `[{ query: "Profiler not enabled. Run db.setProfilingLevel(1) to enable." }]`, and the outer catch
   at `:830` answers `[{ query: "Error fetching health info" }]` for a read that failed entirely.
-- `src/lib/db/providers/sql/sqlite.ts:721-731` - EVERY SQLite database answers two synthetic rows,
+- `src/lib/db/providers/sql/sqlite.ts:707-717` - EVERY SQLite database answers two synthetic rows,
   `Integrity: OK|FAILED` and `Journal Mode: <mode>`, about statements that were never executed.
 
 A sentence wearing a row's clothes is the fabrication the absence rule (#477) forbids, and here it is
@@ -346,8 +392,8 @@ file, and falsifies `src/lib/db/compatibility.ts:267`, `docs/providers/postgres.
 and `tests/helpers/sqlite-node-harness.ts:104`, all of which pin the current sentences.
 
 **The other path swallows instead of fabricating, and that is not better.** On the `slow-queries`
-reading the agent actually uses, `src/lib/db/providers/keyvalue/redis.ts:635-637` and
-`src/lib/db/providers/document/mongodb.ts:1047-1049` `return []` from their catch where MySQL now
+reading the agent actually uses, `src/lib/db/providers/keyvalue/redis.ts:622-624` and
+`src/lib/db/providers/document/mongodb.ts:1041-1043` `return []` from their catch where MySQL now
 rejects. So a denied grant reaches the model as an empty reading, and the run prompt tells it
 `"A reading that comes back EMPTY is an answer, not a failure - no blocked session, no slow query,
 no unused index is what a healthy server looks like"` (`src/lib/agent/investigation.ts:1485`). It
@@ -378,12 +424,12 @@ MongoDB's `getOverview()` catch now omits it too.
   `databaseSize: TRINO_UNAVAILABLE_TEXT`, and `sql/search/index.ts:849` pairs `sizeBytes ?? 0` with
   `databaseSize: SEARCH_UNKNOWN_TEXT` for both `elasticsearch` and `opensearch`.
 - Swallowed into an initialiser the way D40's connection counts were: `sql/mssql.ts:1111`,
-  `sql/oracle.ts:1178`, `sql/sqlite.ts:808`.
+  `sql/oracle.ts:1154`, `sql/sqlite.ts:794`.
 - Coerced by a helper that returns 0 for an absent row: `sql/druid/introspect.ts:578` and
   `sql/clickhouse/index.ts:833` through their local `asNumber`.
-- Coerced inline: `sql/postgres.ts:1397` and `sql/mysql.ts:1156` (`parseInt(... || "0")`),
+- Coerced inline: `sql/postgres.ts:1360` and `sql/mysql.ts:1158` (`parseInt(... || "0")`),
   `sql/libsql/introspect.ts:399` and `document/couchbase/index.ts:606` (`?? 0`),
-  `keyvalue/redis.ts:603`, and `embedded/libredb.ts:709`, whose `fileSizeBytes()` returns 0 when the
+  `keyvalue/redis.ts:590`, and `embedded/libredb.ts:709`, whose `fileSizeBytes()` returns 0 when the
   `statSync` throws.
 
 **The consumer makes it visible.** `src/components/monitoring/tabs/StorageTab.tsx` keys its entire
@@ -464,7 +510,7 @@ correct in isolation and only the running product puts them together.
 `TablesTab.tsx:390` calls `handleMaintenance(type, table.tableName)` - the BARE table name - from a
 row whose very next line (`:350`) renders `table.schemaName` beside it. Every provider's
 `qualifyMaintenanceTarget` then supplies a default schema for an unqualified target:
-`postgres.ts:1285` returns `"public." + escapeIdentifier(target)`, and
+`postgres.ts:1287` returns `"public." + escapeIdentifier(target)`, and
 `duckdb/index.ts:712` returns `"main"."<target>"`. So the statement names a table that is not there.
 
 Measured on DuckDB v1.5.5, clicking **Analyze Table** on the `analytics.events` row:
@@ -533,6 +579,967 @@ FIELD inside a successful response is a different question and needs its own mea
 optional fields are absent rather than 0 on the refusal, each provider's doc and test move with it, and
 `maxConnections` keeps its 0 - for that field the type says 0 and absence are one fact.
 
+### D52. A Couchbase node behind a port mapping is unreachable
+
+`http-transport.ts` resolves the query service from the cluster's own node map, which is right for a
+plain deployment and wrong behind a port mapping. A node advertises its INTERNAL ports there, so a
+container published on other host ports hands back an address only the container can reach, and the
+`DEFAULT_QUERY_PORT = 8093` fallback at `http-transport.ts:484` is unreachable for the same reason.
+The connection's own port is read for management (`:367`) and never for the query service.
+
+Measured on Couchbase CE 8.0.2 during the object-model epic's live acceptance: a node published on
+38091/38093 failed while the same node on 8091/8093 worked.
+
+Reproduced on a second port pair on 2026-09-13, against Couchbase Server 8.0.2 Community published on
+host ports 18091/18093 (#789). `connect()` succeeds over the management port, and the first
+query-service call fails with `Couchbase request failed: Unable to connect. Is the computer able to
+access the url?`, because the node map advertises 8093 and nothing listens there on the host.
+Publishing 8091/8093 makes the same provider work unchanged, which is the control.
+
+Couchbase's own answer to this is `alternateAddresses.external`, which the transport already prefers
+when the cluster publishes it (`:473-477`), so an operator-configured cluster is fine today. What is
+not handled is the ordinary developer case of a stock image published on other ports, where nothing
+configures the external address and the user has already told us the port.
+
+Not fixed inside #789 because it is a transport defect with no object-model component, and that PR
+is a major already carrying seventeen providers.
+
+**Done when:** a Couchbase connection reaches the query service on a node published behind a port
+mapping, with the precedence between the node map, the external addresses and the user's own port
+stated where a reader meets it.
+
+### D54. The data profiler can only profile columns on PostgreSQL-family engines
+
+`src/app/api/db/profile/route.ts:115-116` casts every column with `${safeCol}::text` to take
+its `MIN` and `MAX`. That is PostgreSQL's cast syntax, and it is written once for every engine:
+SQL Server, Oracle, MySQL, ClickHouse and the rest reject it, so each column comes back as
+"Could not profile this column" while the row count and the column list beside it are correct.
+The failure is per column and the panel still renders, which is why it reads as a data problem
+rather than a dialect one.
+
+Measured in a browser during #789's review, on SQL Server 2022 against `shop.dbo.customers`:
+three columns, three refusals, two rows counted correctly.
+
+Pre-existing and not caused by #789: `git show main:src/app/api/db/profile/route.ts` carries the
+identical two lines. It became visible because the object tree's row menu now offers Profile on
+every relation of every engine, where the flat explorer offered it on the tables it listed.
+
+Closing it is a per-dialect text cast measured on each engine rather than a one-line change:
+Oracle has `TO_CHAR`, SQL Server `CAST(x AS NVARCHAR(MAX))`, MySQL `CAST(x AS CHAR)`, ClickHouse
+`toString`, and `MIN`/`MAX` over a cast do not order the same way everywhere, so what the two
+numbers MEAN needs stating per engine rather than assuming a lexicographic answer is wanted.
+
+**Done when:** a column profiles on every engine whose provider offers the action, or the action
+is not offered where it cannot answer, with the engine's own sentence rather than a generic one.
+
+### D55. The admin Operations table list does not print a row's schema
+
+Two tables with the same label in different schemas render as identical rows, so an operator
+choosing between them has only the deep link's own marking to tell them apart. Found while moving
+the maintenance deep link onto the object path in #789, which now carries the full address; the
+list it lands on still shows a bare name.
+
+**Done when:** a row in that list is identifiable without relying on what marked it.
+
+### D56. A Druid lookup's JSON definition is unreachable from the one URL a connection carries
+
+Fifteen of the seventeen shipped type-ids read object source under #789, measured by the census in
+`tests/isolated/object-source-declarations.test.ts`; druid and libredb are the two that read none.
+Two of Druid's three kinds have nothing to read: a datasource and a system table were never written
+down as a statement, measured from the parser's own refusal, which enumerates every statement it
+expected and includes no form of `CREATE`. The third is different. A `lookup` IS authored, as a JSON
+spec, and `GET /druid/coordinator/v1/lookups/config/{tier}/{id}` answers that spec back. Nothing in
+this product can ask for it.
+
+What SQL answers instead is the lookup's key and value PAIRS (`SELECT * FROM lookup.<name>`, columns
+`k` and `v`, measured on Apache Druid 37.0.0). Those are its content. The spec's type (`map` versus
+`cachedNamespace`), its polling period and the namespace it extracts from appear nowhere in SQL, so
+rendering the pairs under a caption that says "definition" would show a user something that is not
+the definition.
+
+Three things make this a transport change rather than a source read:
+
+- `src/lib/db/providers/sql/druid/transport.ts` publishes exactly two members, `query(sql, opts)`
+  and `close()`. `query` takes a SQL string, so no member can address any other path on the cluster.
+- `tests/unit/db/druid/seam-guard.test.ts` parses every file in the provider directory and fails the
+  build when a bare `fetch` or an endpoint path appears outside `http-transport.ts`, so provider
+  logic cannot reach around the seam either.
+- A connection carries ONE host and ONE port. A Broker-only deployment serves the SQL endpoint and no
+  Coordinator API at all, and a Router serves it only when `druid.router.managementProxy.enabled` is
+  set, which `database-compose.yml` sets for this repository's own cluster and a production
+  deployment need not. So the read has to be able to come back empty-handed for a reason about the
+  DEPLOYMENT rather than about the object, which needs a refusal sentence this provider does not
+  have.
+
+Two further things anyone taking this on has to settle before writing code, both open:
+
+- The endpoint above is DOCUMENTED against the Druid 37.0.0 API reference and was NOT measured
+  against a cluster here, so measuring it is step one.
+- Which tier to ask for. The path takes a tier, `__default` being the usual one, and a Router-only
+  deployment gives no list of tiers to a caller who has not already reached the Coordinator. Whether
+  to enumerate tiers first, or to ask `__default` and refuse by name, is the design question.
+- Writing back is not symmetrical with reading. Posting a lookup spec requires its `version` field to
+  be BUMPED, so #778's edit half cannot round-trip a read spec unchanged, and the version handling is
+  part of the work rather than a detail after it.
+
+**Done when:** a Druid lookup shows its own JSON spec, or the object surface says in the engine's own
+terms why this deployment cannot reach it.
+
+### D57. MariaDB's `package` and `sequence` folders are never drawn in the standalone tree
+
+`POST /api/db/provider-meta` reads `getCapabilities()` off a provider it never connects
+(`src/app/api/db/provider-meta/route.ts:44`, #457), and `MySQLProvider.objectKinds` is the one
+declaration in the fleet resolved from the server's own `VERSION()` string, so an unconnected
+provider answers the MySQL six and the client's copy of the declaration never gains MariaDB's two.
+The tree draws its folders from that copy (`src/components/object-tree/flatten.ts`), so the two kinds
+have no folder and their source cannot be reached from the tree.
+
+Both kinds are fully implemented behind the API: a connected provider counts, lists, describes and,
+since #789, reads the source of both. Only the client's copy is stale.
+
+The smallest correct fix reads the connected provider out of the factory cache and re-reads
+`provider-meta` once the connection is warm, about ten lines. A `peekConnectedProvider(connectionId)`
+on `factory.ts` that returns the already-connected instance opens no socket and keeps
+`tests/unit/db-tunnel-discipline.test.ts` green, measured. The design question inside it is WHEN to
+re-read: an unconditional re-read costs a round trip on all seventeen engines and changes the
+capabilities object identity, invalidating every memo keyed on it.
+
+Two limits measured while writing this. It is NOT fleet-wide: `ProviderCapabilities` has exactly
+three connection-resolved values, `objectKinds`, `supportsExplain` and `explainFormat`, so a correct
+fix also changes when the EXPLAIN affordance is offered on PostgreSQL and the four MySQL-wire
+relatives, and that is a behaviour change rather than a repair. And the embedded half cannot be
+closed the same way, because a host declares its own capabilities to `StudioWorkspace`, so closing it
+there is a published-surface change.
+
+Measured end to end 2026-09-13 against MariaDB `12.3.2-MariaDB-ubu2404` in a browser, while grounding
+#778 Phase 3: the tree drew Tables, Views, Stored Procedures, Functions, Triggers and Events and no
+Packages folder; `POST /api/db/provider-meta` answered those same six kinds; and at the same moment, for
+the same connection, `POST /api/db/objects/source` answered the package's specification and body in full.
+So the CONNECTED provider declares and serves `package`, and the declaration the CLIENT holds does not
+carry it. The object was reachable only by hand-writing a restored tab.
+
+This is load-bearing for the editing phase rather than cosmetic: any client-side predicate built on
+`provider-meta`'s answer is, on MariaDB, built on the wrong server's declaration.
+
+One sentence in the tree contradicts this entry, and it is the reason the entry is easy to lose.
+`flavourFor`'s docblock (`src/lib/db/providers/sql/mysql.ts:1189`) says that defaulting to MySQL
+"costs two folders a MariaDB user regains the moment the connection is live". Nothing re-reads
+capabilities once a connection opens, which is this entry's whole subject, so a reader who meets that
+sentence first concludes the gap closes itself and stops looking. It is on `origin/main` and
+untouched by the object-tree work, and it is corrected here rather than in an entry of its own
+because the sentence and the defect have one repair.
+
+**Done when:** a MariaDB connection draws its Packages and Sequences folders in both shells, or the
+provider doc says which surface cannot have them and why, and `flavourFor`'s docblock no longer says
+the two folders come back when the connection is live.
+
+### D58. A ClickHouse function with a non-SQL origin has never been read live
+
+The source read's refusal arm for `ExecutableUserDefined` and `WasmUserDefined` is driven in the
+suite by a server answering an empty `create_query`, and killed by mutation, but no such function has
+ever existed on the fixture. Creating one needs a `*_function.xml` in the server configuration
+directory beside the script it runs, and `database-compose.yml` mounts neither directory.
+
+What is owed once the compose file is free to change: add a `*_function.xml` mount and a script
+directory to the clickhouse service, create one executable function in `docker/clickhouse-init/`, and
+read it back through the real provider to confirm the server answers an empty `create_query` and an
+`origin` of `ExecutableUserDefined`, which is what the refusal sentence claims.
+
+Cost if wrong: the sentence names an origin the server does not report that way, and a reader is told
+a body is an external program on a server that spells the absence differently. The Enum8 vocabulary
+is measured (`Enum8('System' = 0, 'SQLUserDefined' = 1, 'ExecutableUserDefined' = 2, 'WasmUserDefined'
+= 3)`), so only the empty-`create_query` half is unmeasured.
+
+**Done when:** one executable function exists in the fixture and its refusal is read back from a
+running server rather than from a double.
+
+### D59. A Trino materialized view has no fixture here, and the cheap route is measured shut
+
+`docker/trino-init/01-object-fixture.sql` seeds no materialized view, so the one object kind whose
+source read this repository cannot reproduce is `trino.materialized_view`. The read IS implemented
+and IS tested, against a payload captured from a live cluster, but the cluster that produced it is
+not one `database-compose.yml` can start.
+
+THE CHEAP ROUTE WAS PROBED AND REFUSED, and the measurement is the point of this entry, so the next
+attempt starts from a fact rather than from the same hope. Measured 2026-09-13 on trinodb/trino:476
+with an Iceberg JDBC catalog on PostgreSQL 18:
+
+- The JDBC catalog WORKS. `CREATE SCHEMA` answered `CREATE SCHEMA`, `CREATE TABLE
+  iceberg.warehouse.orders (id bigint, total double)` answered `CREATE TABLE`, and `INSERT INTO
+  iceberg.warehouse.orders VALUES (1, 10.0), (2, 20.0)` answered `INSERT: 2 rows`.
+- `CREATE MATERIALIZED VIEW iceberg.warehouse.order_totals AS SELECT id, total FROM
+  iceberg.warehouse.orders` answered `createMaterializedView is not supported for Iceberg JDBC
+  catalogs`.
+- Two traps on the way: Trino 476 never creates the JDBC catalog's own `iceberg_tables`, so every
+  statement fails `Cannot check and eventually update SQL schema` until the two Iceberg V1 tables are
+  created by hand; and a `file://` warehouse needs `fs.hadoop.enabled=true`, where
+  `fs.native-local.enabled` plus `local.location` refuses to START the coordinator with `Invalid
+  configuration property local.location: file does not exist: file:/data/warehouse` for a directory
+  that exists and is writable inside the container.
+- The materialized view WAS then created on an `apache/hive:4.0.1` standalone metastore, which is
+  what produced the measured `Create Materialized View` reply column.
+
+So the remaining price is a metastore service and a warehouse volume in `database-compose.yml`, and
+the decision to pay it is a compose-file decision rather than an object-surface one.
+`docs/providers/trino.md` carries the full command set meanwhile.
+
+**Done when:** `database-compose.yml` starts a cluster on which the shipped fixture creates a
+materialized view, or the provider doc is accepted as the permanent home of those commands.
+
+### D60. `countObjects` reports a MongoDB transport failure as the engine's own refusal
+
+`src/lib/db/providers/document/mongodb.ts` `countObjects` catches every `listCollections` rejection
+and answers `{ unavailable: <the error message> }` for every declared kind.
+
+Measured against mongodb 7.6.0 and MongoDB 8.2.12: only a `MongoServerError` is the server's own
+error reply. A `MongoServerSelectionError` ("connect ECONNREFUSED ...") or a `MongoNotConnectedError`
+("Client must be connected before running operations") is a transport failure the server never
+answered, and the tree then badges a folder with a socket message as though MongoDB had refused the
+read.
+
+#789 fixed this for `readObjectSource` only (`isServerErrorReply` in the same file), because
+`KindCount`'s `unavailable` arm is a contract shared by the whole fleet and one provider moving alone
+would make the fleet inconsistent.
+
+The decision to take is whether `KindCount.unavailable` means "the engine refused" fleet-wide, in
+which case every provider's count catch needs the same discrimination and a transport failure should
+raise.
+
+**Done when:** a test per provider drives a transport-shaped rejection through `countObjects` and
+asserts it raises rather than badging, and the same for `listObjects`.
+
+### D61. Elasticsearch and OpenSearch object source re-serialises the cluster's JSON, so three values are re-spelled
+
+`readObjectSource` renders a pipeline's or a template's definition with `JSON.parse` followed by
+`JSON.stringify`, because the definition is a sub-document of the endpoint's answer and there is no
+extended-JSON writer for a REST payload.
+
+Measured on Elasticsearch 9.1.4 and OpenSearch 3.8.0 on 2026-09-13 against `probe_json_edges` in
+`docker/search-init/01-object-fixture.sh`: the cluster answers `9223372036854775807` and the pane
+shows `9223372036854776000`, `1.0E30` becomes `1e+30`, and a map keyed `zz, 10, 2, aa` is rendered
+`2, 10, zz, aa`.
+
+Nothing is dropped, so `form: "complete"` is true, and both provider docs record all three under
+"Object source (#789)". A faithful rendering would need the sub-document sliced out of the response
+TEXT rather than re-serialised, which is a small JSON scanner nobody owns today.
+
+It matters for #778 Phase 3: a definition holding a long past 2^53 must not be edited and PUT back
+from the pane.
+
+**Done when:** either the pane shows the cluster's own bytes, or the edit half is refused on a
+definition whose re-serialisation is not byte-identical to what was read.
+
+### D62. Two PostgreSQL source refusals are unverified on CockroachDB and Materialize
+
+`PostgresProvider.readObjectSource` reports exactly two SQLSTATEs as a refusal part, 42883 (`pg_get_*`
+absent) and 42703 (`pg_proc.prokind` absent), and both arms exist because this type id also serves
+CockroachDB and Materialize.
+
+The sentences in `tests/integration/db/postgres-provider.test.ts` are the SHAPE PostgreSQL 18.4
+answers for a missing function and a missing column, measured; neither fork was brought up. The
+provider carries no string of its own, so a wording difference cannot break it, and what is
+unverified is only the claim that those two SQLSTATEs are what a fork answers there.
+
+**Done when:** each fork is brought up, a view's and a routine's source is asked for through the
+shipped statements, and the SQLSTATE and the sentence are recorded in `docs/providers/postgres.md`.
+If either answers a third code, that arm is a code change and not a doc change.
+
+### D63. `postgres.ts`'s `describeObject` still binds `[path[0], path[1]]`
+
+Standing ruling 5g's second spelling, in `describeObject` in
+`src/lib/db/providers/sql/postgres.ts`. It is behaviour-identical at depth 1 and silently wrong at
+depth 2, and the source read does not use it. The object-model epic assigned it to a final sweep
+rather than to the task that found it, so it is recorded here rather than left in a work file.
+
+**Done when:** the name is `path[path.length - 1]` and the container is
+`path.slice(0, containerDepth(capabilities))`, plus the two-level `spyOn` test driven all the way to
+the binds, the way `readObjectSource` is already pinned.
+
+### D64. The PostgreSQL trigger LISTING join is unpinned, so the tree could list no trigger at all
+
+`LIST_TRIGGERS_SQL` in `src/lib/db/providers/sql/postgres.ts` joins
+`pg_catalog.pg_class c ON c.oid = t.tgrelid`, which is what makes a trigger's row name its base table.
+Mutating that one column to `tgconstrrelid` leaves the whole suite green.
+
+Measured 2026-09-13: with the mutation applied, `bun test tests/integration/db/postgres-provider.test.ts`
+is 205 pass 0 fail, identical to the unmutated control. `tgconstrrelid` is 0 for every ordinary
+trigger, so a real server would join nothing and the Triggers folder would list nothing, while the
+count beside it kept counting. Nothing in the tree would say so.
+
+The SOURCE statement added by #789 IS pinned as text at
+`tests/integration/db/postgres-provider.test.ts:4393`; this is the Phase 1 LISTING statement beside
+it, which is not.
+
+**Done when:** the listing statement is pinned as text the way the source statement is, and the
+mutation above fails by name.
+
+### D65. A provider suite whose double dispatches on the statement the test builds cannot see the statement change
+
+Five mutants of one class survived the PostgreSQL suite until its first fix round: three predicate
+deletions, one relkind swap and one pretty flag. All of them are edits to statement TEXT that leave
+the binds untouched, and all are invisible to a double that routes by the `pg_get_*` function name
+the test itself constructed.
+
+#789 closed this for the SOURCE statements: each provider task pinned its own source statement as
+text and reported its mutation numbers. The Phase 1 listing and counting statements across the fleet
+were not swept the same way, and D64 is the one instance that has been measured.
+
+**Done when:** every provider's listing and counting statements are pinned as text, one assertion per
+statement, with the mutation numbers recorded rather than a sample of them.
+
+### D66. The SQLite kind-vocabulary guard scrapes source text, so a kind can be declared and unmapped
+
+The guard in `tests/unit/lib/agent/context-snapshot.test.ts` scrapes `SQLITE_OBJECT_KINDS` with a
+`{ id: "..."` regex that only matches a SINGLE-LINE entry, so a kind written across two lines drops
+out of the population the guard compares.
+
+Measured 2026-09-13, both directions. Exploding an EXISTING entry past 120 columns is a LOUD red: two
+declared ids against the agent side's four, 1 fail, "Expected - 0 / Received + 2", with `table` and
+`trigger` unmatched. So that half is safe. But adding a FIFTH kind as a multi-line entry drops it from
+the guard's population AND it is absent from `COMPOSED_KIND_WORDS`, both sides shrink together, and
+the guard passes at 1 pass 0 fail, while the same kind written on one line fails.
+
+So the defect is a kind that is declared and unmapped, not a formatter. The provider keeps its entries
+on one line so they stay scrapable and says so in a comment.
+
+**Done when:** the guard reads the declaration through
+`createDatabaseProvider("sqlite").getCapabilities()` instead of scraping source text, and a
+multi-line entry for an unmapped kind fails it.
+
+### D67. `assertObjectPathShape` is written out eight times, and four more shapes twice or three times
+
+Measured in the tree on 2026-09-13: `assertObjectPathShape` is DEFINED, not imported, in eight
+provider files (`postgres.ts`, `mysql.ts`, `oracle.ts`, `sqlite.ts`, `libsql/objects.ts`,
+`clickhouse/objects.ts`, `cassandra/objects.ts`, `document/mongodb.ts`). It belongs beside
+`containerDepth` in `src/lib/db/object-kinds.ts`, which is where `comparePaths` already went: that
+one was written four times, was hoisted to `src/lib/db/object-path.ts`, and is now imported by every
+caller, so the pattern is settled and only this helper is left behind.
+
+Four more shapes are duplicated verbatim by the source reads:
+
+- `OBJECT_SOURCE_SQL` and `SOURCE_CATALOG_TYPES`, twice, in `sqlite.ts` and `libsql/objects.ts`.
+- `blankDefinitionShape` and `blankDefinitionReason`, three times, in those two plus
+  `duckdb/objects.ts`. The last two carry three sentences each, so there are copies of six sentences
+  that must not drift, and only the duckdb pair is exported.
+
+libSQL IS SQLite and the two source reads are the same statement against two transports, which is why
+that pair is worth taking first.
+
+None was hoisted when it was found because concurrent implementers held the checkout and a hoist
+collides with every one of them.
+
+**Done when:** one definition of each replaces the copies, with the sqlite and libsql source read
+sharing its statement.
+
+### D69. Six type-ids still open `readObjectSource` with their own entry guard, and one of its sentences is less true
+
+`requireSourceKind` in `src/lib/db/object-kinds.ts` is the one entry guard for `readObjectSource`:
+it raises separately for a kind the engine never declared, for a declared kind that publishes no
+definition text, and for a source-bearing kind carrying no `sourceLanguage`. Measured on 2026-09-13,
+nine providers call it (sqlite, libsql, duckdb, clickhouse, cassandra, postgres, mssql, mysql,
+trino) and six type-ids do not: couchbase, mongodb, redis, elasticsearch and opensearch (one shared
+module) and oracle.
+
+All five of those modules COLLAPSE the first two facts into one throw. They test
+`spec?.hasSource !== true` and answer `<Engine> declares no readable source for the kind "X"`, so a
+kind the engine has never heard of and a declared kind with no definition text arrive as the same
+sentence. That sentence is not merely shorter, it is less true: it tells the caller the kind exists
+and has no source. Three of them (couchbase, mongodb, search) also spell the third arm differently,
+"declares source for the kind X and no sourceLanguage, so its text has no language to render in"
+rather than "declares readable source for the kind X and no sourceLanguage to render it with".
+
+A fourth spelling of the same refusal lives at the route layer: `src/lib/api/object-route.ts` raises
+`<type> declares no readable source for kind "X"` as an `ObjectRouteError` with a 400, before any
+provider is consulted. It guards a different fact and answers a different error type, so it is not
+simply a call site, but it is a fourth wording of one refusal.
+
+None of the six was converted when the guard was hoisted (#789), because converting them rewords
+between one and two throws each, five provider suites assert on the exact wording, and a reworded
+throw is a behaviour change that does not belong folded inside a refactor. The cost of leaving them
+is that the hoist's second-order gain, that a new provider cannot silently forget one of the three
+guards, holds for nine of seventeen type-ids only.
+
+**Done when:** the six call `requireSourceKind`, with the five provider suites' assertions moved onto
+the guard's three sentences in the same commit, and the route layer either reuses one of those
+sentences or its docblock says why a 400 raised before the provider is a different fact.
+
+### D70. The DuckDB multi-statement sentence is an inference in a measurement's voice, and the tail does run
+
+`docs/providers/duckdb.md` section 3.11 says a multi-statement string runs the first statement only, that the rest is
+silently discarded, and that there is no error and no second result.
+`src/lib/db/providers/sql/duckdb/index.ts:699-703` says `client.run()` executes only the FIRST statement and that the
+method guarantees the tail is never executed.
+
+Measured 2026-09-13 on DuckDB v1.5.5 through `@duckdb/node-api` 1.5.5-r.4, while grounding #778 Phase 3.
+`CREATE TABLE probe_c(i INTEGER); CREATE TABLE probe_c(i INTEGER)` answers
+`Catalog Error: Table with name "probe_c" already exists!`, which is the SECOND statement's error, and `duckdb_tables()`
+then holds `probe_c`.
+`DROP VIEW probe_v; CREATE VIEW probe_v AS SELECT * FROM no_such_table_here` raises the second statement's error and
+leaves the view dropped.
+So the tail runs, the failure rolls nothing back, and the discard is neither silent nor a discard.
+
+The measurement quoted in section 3.11 is real and it is about the RESULT: `runAndReadAll` returns the first statement's
+rows and not the second's.
+The sentence built on it is about EXECUTION, which nobody ran, and the two are different claims.
+This is the same class as the entries this file already carries about inferences written in a measurement's voice.
+
+The security consequence is bounded rather than open, and the bound should be stated rather than assumed: the guard
+beside the docblock reads the whole string before the call, so a forbidden form hiding in the tail is still refused, and
+`access_mode` is fixed read-only on that path.
+What is wrong is the stated reason, which is the load-bearing half of a security docblock.
+
+**Done when:** the code docblock and all three places in the provider doc say what was measured, which is that the first
+statement's rows are returned and the tail still runs, or the claim is re-measured on a version where it holds and that
+version is named.
+
+### D73. Session state written by one HTTP request is read by every later request, across Studio users
+
+The provider cache is one entry per `connection.id` process-wide, so a `SET` that survives the statement
+survives the request and reaches the next borrower whoever they are.
+
+Measured 2026-09-13 on PostgreSQL 18.4 through the product: a `SET` issued by a `user`-role session was
+read back by an `admin` session on the same backend pid, was not visible on a different connection id,
+and was not visible to a fresh psql session.
+Concurrent requests were served by different backends, so the leak is the cached provider rather than any
+serialisation.
+
+The same class is already measured on two other engines by this epic's Phase 3 grounding: `resetOnRelease`
+is false on the MySQL pool, and a `USE` persists on the SQL Server pool through both of node-mssql's send
+paths.
+
+It is not only cosmetic state. `search_path`, `sql_mode`, `USE` and `SET ROLE` all change what a later
+statement MEANS, and none of them is reset.
+
+**Done when:** either the pool resets a connection on release, or every route that mutates session state
+restores it in a `finally`, and the choice is written down where the next writer of a route will read it.
+
+### D88. A multi-statement text sent to the single-statement query route answers HTTP 500
+
+`POST /api/db/query` is the single-statement route and nothing stops a caller sending two. PostgreSQL
+runs both, `pg` answers an ARRAY of results for a multi-statement simple query, and
+`PostgresProvider.query()` reads `result.rows` off that array, which is `undefined`. The route then
+reads `result.rows.length` and throws, so the caller gets a 500 with no sentence about what was wrong
+with their request, after both statements have already run.
+
+MEASURED 2026-09-15 on PostgreSQL 18.4 through `pg` 8.23: a simple query of two statements answers
+`[Result, Result]` with the engine's own command tags, and `Array.prototype.rows` does not exist.
+Read in the tree at the same commit: `src/lib/db/providers/sql/postgres.ts` returns `rows: result.rows`
+from `query()`, and `src/app/api/db/query/route.ts` reads `result.rows.length`.
+
+Found while probing D74. Not caused by it and not fixed by it.
+
+**Done when:** the route either refuses a text carrying more than one statement with a sentence, or the
+provider names which result of an array it answers with. The first is the smaller change and is what
+the route's own name claims; D76's single-statement check on the object-edit path is the precedent for
+asking the engine rather than splitting the text.
+
+### D89. A count mismatch is reported on the `interrupted` arm, whose documented meaning says the engine never answered
+
+`applyObjectEdit` on `postgres` counts the results the round trip answered and reports
+`{ outcome: "interrupted", committed: "unknown" }` when that count is not the four statements the
+emitted unit is made of (D76).
+
+`src/lib/db/types.ts` documents that arm as "the statement was SENT and the engine's answer never
+arrived: a timeout, a cancellation, a dropped socket, or any throw out of `applyObjectEdit`". For a
+count mismatch the answer DID arrive and the engine DID speak, so the arm is used outside its own
+contract, and the UI copy is written against the contract rather than against the member:
+`src/components/object-source/ApplyPreviewDialog.tsx` renders "This apply's outcome is unknown" and
+"**Whether it reached the server is unknown.** Read the definition again before you edit it." above
+the provider's true sentence. The second line of `OutcomeRegion`, which X20 narrowed to "Whether it
+was applied is unknown: LibreDB has no answer that says whether it landed", IS true of this member.
+
+The provider side was weighed and left as it is, with the reason written into
+`src/lib/db/providers/sql/postgres.ts` and `docs/providers/postgres.md`: no other arm in the union
+fits better, and an arm added on the provider side ALONE falls into `applyFrame`'s `applied` tail,
+which has no exhaustiveness check, so the reader would be shown "This apply is done. The new
+definition is on the server." That is strictly worse than today.
+
+**Done when:** either a seventh outcome arm exists with its wire shape in `src/lib/db/types.ts`, its
+own arm in `ApplyPreviewDialog.applyFrame` and `OutcomeRegion`, and tests for both; or the
+`interrupted` docblock in `src/lib/db/types.ts` and the `applyFrame` disposition line are narrowed to
+what is true of every member, and a test pins that the dialog's first line makes no transport claim.
+
+### D90. Three type-ids declare a `endOpenQueryTransaction()` absence that is not final
+
+D75 asked every type-id that does not implement the surface to say WHICH absence it is, and all
+fourteen now do. Three of those answers are explicitly provisional, and each provider doc says so
+where it bites. They are collected here because a doc that says "this is filed as its own change"
+needs the change to exist.
+
+**`mysql` and `mssql`: the DRIVER cannot be asked, and the SERVER can.** Both were measured live.
+On MySQL 8.0.46 through `mysql2` 3.24.4, with the question asked from outside the pool on the
+released session's `threadId`, `performance_schema.events_transactions_current` answers `ACTIVE`
+for a bare `BEGIN` and for a `BEGIN` followed by a failing statement, and `ROLLED BACK` for the
+control. On SQL Server 2022 through `mssql` 12.7.2, `sys.dm_exec_sessions.open_transaction_count`
+on the released session's `@@SPID` answers 1 and 1 against a control of 0. Both readings are taken
+AFTER the connection went back to the pool, so they also measure that the leak is real rather than
+inferred. `docs/providers/mysql.md` section 6.1 and `docs/providers/mssql.md` section 6.1 carry the
+full tables.
+
+Neither was implemented on that ask, for one reason each and both written down. On `mysql` the
+provider also serves MariaDB, where `performance_schema` is OFF by default and its tables answer
+NULL rather than failing, so the same query would report no open transaction while one is open, and
+rolling nothing back is the one outcome worse than reporting nothing. That needs a per-server
+capability probe of the kind `objectKinds` and the EXPLAIN grammar already use on this provider.
+On `mssql` the state is readable on `tedious`'s `Connection`, which `mssql.Request` never hands out.
+
+**`trino`: nobody has measured it yet.** The code side is settled and `docs/providers/trino.md`
+section 3.14 states it: the coordinator carries a transaction on `X-Trino-Transaction-Id`, the
+transport writes and reads neither, so this provider holds nothing between statements that the
+surface could name. What is unmeasured is the other end, what a live coordinator does with a
+transaction whose id was dropped, how long it survives the idle timeout, and whether it holds
+anything a later user of the same cluster notices.
+
+**Done when:** each of the three either implements the surface or its doc records the measurement
+that closes the question. For `mysql` that is a per-server `performance_schema` capability probe
+plus the implementation behind it. For `mssql` it is whether a pinned `ConnectionPool.acquire()`
+connection can carry a statement at all. For `trino` it is one run against a live coordinator.
+
+### D91. The embedded shell's apply refusal cannot be placed, styled or suppressed by the host
+
+`src/workspace/StudioWorkspace.tsx` renders the D82 refusal itself, as an `output` portaled to
+`document.body` at `fixed bottom-4 right-4 z-[60]`. That is the only viewport-fixed element the
+package's own shell paints, and it lands in the HOST's chrome: the adopter cannot move it, restyle
+it, route it into their own notification surface or turn it off. MEASURED and written into the
+docblock: a body child also falls outside `STUDIO_SCOPED_CSS`, so it renders in the host page's font
+at `letter-spacing: normal` while the workspace box renders at `-0.011em`. The colour tokens are on
+`:root` and survive. The portal itself is not the negotiable part, it is what makes the live region
+reachable at all (`hideOthers` marks the box and installs no observer).
+
+Second, smaller, and in the same surface: `onApplyInFlightChange` on
+`src/components/object-source/ObjectSourceView.tsx` is optional, and the `undefined` arm now has no
+shipped caller. The pane has exactly two mounts in `src` (`Studio.tsx:1127`,
+`StudioWorkspace.tsx:833`) and both pass it; `src/exports/` re-exports the pane from nowhere and
+`dist/*.d.ts` carries no `ObjectSourceView`, so no adopter can mount it without the prop. The arm
+exists for the 14 mounts in `tests/components/object-source/ObjectSourceView.test.tsx` and for
+nothing else.
+
+**Done when:** the host has a documented way to receive or place this refusal instead of having it
+painted into their chrome, with a test for the default (still shown) and for the host-handled path;
+AND `onApplyInFlightChange` is either made required, with the pane's test mounts updated, or its
+optionality is justified in the props docblock by a caller that actually exists.
+
+### D92. A multi-statement script is not guaranteed one pooled backend, so its BEGIN and its COMMIT can land apart
+
+`POST /api/db/multi-query` runs a script by calling `provider.query()` once per statement, and each
+call does its own `pool.connect()`. Nothing holds one backend for the script's lifetime. Under
+concurrent traffic on the same connection id, a script's `BEGIN` and its `COMMIT` can therefore be
+served by different backends, which commits nothing and leaves the first backend's transaction to
+D87's scope-bound ender.
+
+NOT REPRODUCED, and said in that voice. `pg`'s idle list is LIFO and a script's statements run back
+to back, so the same client comes back nearly always: measured 2026-09-15 on PostgreSQL 18.4, six
+concurrent script runs answered identical backend pids throughout. What is missing is a construction
+that forces the interleave, not an argument that it cannot happen.
+
+Found while reviewing D87. It is independent of D87 and was not introduced by it: D87 bound the
+ENDER to the caller's own scope, which is what makes the first backend's transaction reachable at
+all, and this entry is about the script's own statements being spread across backends in the first
+place.
+
+**Done when:** either a probe forces the interleave and the result is recorded, or the route holds
+one client for the script's scope. The second changes pool semantics for every caller of `query()`
+and is the larger change, which is why this is filed rather than folded into D87.
+
+### D93. One connection id can hold unboundedly many live SSH forwards, and only whole-connection teardown reaps them
+
+D86 was closed by KEYING the tunnel pool on the forward - `(connectionId, remoteHost, remotePort,
+tunnelRoute(sshConfig))` in `poolKey`, `src/lib/ssh/tunnel.ts` - rather than by refusing a mismatch.
+That was the trade D86 itself allowed, and refusing is still the wrong answer: nothing on the
+edit path closes a stale forward, so a refusal would leave the connection unusable, and every second
+provider on a live tunnel legitimately reuses it. The cost is that the pool now holds one live
+forward per distinct (route, far end) asked for under an id, where before it held exactly one.
+
+MEASURED at the unit level, real pool, `ssh2` and `net` faked so the handles are countable
+(`scratchpad/probes/d86-unbounded-route.test.ts`): 50 requests under ONE connection id, 25 far ends
+across two bastions, gave
+
+```
+distinct loopback listeners open under one connection id: 50
+live net servers: 50 live ssh clients: 50
+after closeSSHTunnel, live net servers: 0 live ssh clients: 0
+```
+
+Each entry is an open SSH client plus a listening loopback socket. Nothing in the map reaps a
+superseded one: the provider cache miss that opens the next forward disconnects the PROVIDER
+(`factory.ts`, the query-timeout arm) and leaves the forward pooled. What takes them is the
+connection's own teardown - `removeProvider` and the 30-minute idle sweep, both of which close BY
+CONNECTION ID and take every forward with them - so the count is what one id accumulates inside one
+idle window. It is caller-driven, on the same reachability D86 already established:
+`src/lib/seed/resolve-connection.ts:21-23` returns a posted inline connection verbatim, id included,
+so the host, the port and the bastion of each request are the caller's to vary.
+
+It is disclosed where a writer will read it (the `activeTunnels` docblock states the count, the
+measurement and what reaps it) and it is NOT disclosed to an operator anywhere: no metric, no log
+line counts forwards per connection, and `docs/SECURITY.md` says nothing about it.
+
+**Done when:** the number of simultaneously live forwards under one connection id is bounded, by a
+cap that refuses or by closing a forward once nothing can still be using it, and the choice is
+written down where the next writer of the pool will read it. A test drives N distinct forwards under
+one id and asserts the bound holds, with a control that the honest population is untouched: a second
+provider on the same id, route and far end still gets the one forward and opens no second one.
+
+### D94. On a single-connection provider the transaction ender cannot tell whose transaction it is ending
+
+`endOpenQueryTransaction(scope)` takes the caller's call scope so that a POOLED provider can name the
+client its own statements ran on (D87). The three providers that hold ONE connection, `sqlite`,
+`duckdb` and `redis`, take no argument at all, and their docblocks said the parameter was irrelevant
+there because there is "no other client to name and no request whose transaction this could be". The
+first half is true. The second is false, and one shared connection is what makes another request's
+transaction REACHABLE rather than what puts it out of reach: `getOrCreateProvider` caches one
+provider per `connection.id` for the whole process, so every concurrent request on a stored
+connection shares the one handle. Wave 6 corrected all three docblocks and `docs/providers/redis.md`;
+the defect itself is this entry.
+
+**Redis is the measurable case and the worst one.** A `MULTI` is state of the CONNECTION. Measured
+2026-09-15 on redis 7.4.11 through ioredis 5.11.1 and recorded in `docs/providers/redis.md` section
+5.2a: after a bare `MULTI`, every later command on that connection answers the string `QUEUED` and
+does nothing, `SET`, `GET` and `CLIENT INFO` alike, while a second connection is untouched. Since
+D74, `POST /api/db/query` awaits the ender in its `finally` on every request, and the ender PINGs and
+then `DISCARD`s whatever `MULTI` that PING found. Neither command can say who opened it. So a plain
+`GET` typed by one user drops a `MULTI` another user had just queued commands into, and that user is
+told nothing: their next command answers `QUEUED` from no transaction, and their queue is gone. The
+`DISCARD` catch in `src/lib/db/providers/keyvalue/redis.ts` already reads the same collision from the
+other side, "another caller on this shared connection ended it in between".
+
+`sqlite` and `duckdb` carry the same shape and were checked rather than assumed. Both hold one handle
+for every concurrent request. `sqlite` reads `inTransaction`, which reports the handle's state and
+not who opened it; `duckdb` publishes no transaction reading at all on v1.5.5, so its act IS the ask,
+an unconditional `ROLLBACK` whose refusal is the answer, and a refusal cannot name an owner either.
+NOT SEPARATELY MEASURED on those two: the sharing is measured (2026-09-13, recorded in both
+docblocks, where the NEXT user's write joined an abandoned transaction), and the ender's reach over
+it is read off the code.
+
+The fix is not a parameter. It is transaction OWNERSHIP on a single connection: the provider would
+have to record which scope opened the transaction it later observes, and a transaction opened before
+any scope was recorded, by an interactive session or by a caller that passed no scope, still has no
+owner. Refusing to end an unowned transaction reinstates the leak D71 and D74 exist to close, so the
+two have to be weighed together rather than one at a time.
+
+**Done when:** each of the three either names the scope that opened the transaction it ends, with a
+test that a second scope's ender leaves it alone and a control that its own scope still reaches it,
+or its provider doc records why ending an unowned transaction is the right trade on that engine and a
+test pins the behaviour that was chosen.
+
+---
+
+# D94 (proposed): hand-copied source coordinates across this repository are stale by thousands of lines
+
+**Status:** proposed, wave 6 slot B fix round.
+
+Found while re-deriving the two `postgres.ts` citations that this round's two added import lines
+moved. `src/lib/api/object-route.ts` is the ONLY file whose citations are guarded, by
+`tests/unit/lib/api/object-route-edit.test.ts`, which resolves each anchor and compares the number.
+Every other `file.ts:NNNN` in the repository is hand-copied prose, and a sample of nine measured at
+`64ee0e3f^` was wrong before this round touched anything:
+
+| Citation | Cited in | Anchor actually at |
+|---|---|---|
+| `postgres.ts:917` (`queryReadOnly`) | `docs/AGENT_GUIDE.md:925` | 2396 |
+| `postgres.ts:891` (`BEGIN READ ONLY`) | `docs/AGENT_ANALYST_DESIGN.md:400`, `:718` | 2415 |
+| `postgres.ts:894` (`SET LOCAL statement_timeout`) | `src/lib/agent/tools.ts:1552` | 2418 |
+| `postgres.ts:2070-2074` (`{ ...baseConfig, connectionString }`) | `src/lib/db/connection-fingerprint.ts:67`, `tests/api/db/objects/edit-apply.test.ts:91`, `tests/unit/lib/db/connection-fingerprint.test.ts` x3 | 2256-2262 |
+| `postgres.ts:1241` (`pg_stat_statements extension not enabled`) | `docs/BACKLOG.md:326` | 4001 |
+| `postgres.ts:1287` (`"public." + escapeIdentifier`) | `docs/BACKLOG.md:467` | 4048 |
+| `source-applier.ts:155` (the silent-status sentence) | `tests/components/object-source/ApplyPreviewDialog.test.tsx:1092` | `whenSilent`, elsewhere |
+| `StudioWorkspace.tsx:494` (`<main className="flex-1 overflow-hidden relative">`) | `docs/BACKLOG.md:1360` | 823 |
+| `StudioWorkspace.tsx:833` (the `ObjectSourceView` mount) | `docs/BACKLOG.md:1145` | 919 |
+
+Nine of nine wrong, none of them by this round: the smallest miss is over 500 lines. A reader who
+follows one lands on an unrelated line and cannot tell a moved anchor from a deleted one, and an
+agent that re-derives its own citations after an edit, which this epic has now asked for three
+times, is paying a per-commit tax on coordinates that were never right.
+
+Two halves, and the second is what stops it recurring:
+
+1. Re-derive, or drop, every `file.ts:NNNN` outside `object-route.ts`. Dropping is often the better
+   answer: an anchor quoted as text (`queryReadOnly`, `BEGIN READ ONLY`) is grep-able for ever, while
+   a number is correct only until the next commit.
+2. Generalise the guard. `tests/unit/lib/api/object-route-edit.test.ts` already holds the whole
+   mechanism: a table of `{ as, file, anchor }` and a check that the rendered `as:line` appears in
+   the citing source. Lift it to a repository-wide test that scans for the `file.ts:NNNN` shape,
+   resolves each, and fails on a miss, so a coordinate cannot go stale silently again.
+
+**Done when:** a test fails on a stale `file.ts:NNNN` anywhere under `src/`, `docs/` and `tests/`,
+and the citations present at that commit all resolve. The test needs one case per shape it must
+accept, a single line, a range and a comma pair, and one negative that fails when an anchor moves.
+
+### D85. The `@/lib/auth` mock is hand-copied across a layer, untyped, and already misses two exports
+
+`grep -rl 'mock.module("@/lib/auth"' tests/` returns exactly 38 hits, re-measured 2026-09-20. Seven of
+them spread the real module and replace one function (`{ ...realAuth, getSession: mockGetSession }`,
+the agent routes' pattern). Twenty-nine write out the same five-key object - `getSession`, `signJWT`,
+`verifyJWT`, `login`, `logout` - down to the same `mock(async () => "mock-token")` for a token
+nothing reads, and one of those twenty-nine is `tests/helpers/object-edit-route-harness.ts`, a shared
+harness that could have been the factory and copied the stub instead. The remaining two write a
+shorter stub of their own, one with two keys and one with a single `getSession`.
+
+`src/lib/auth.ts` exports seven names. The two no hand-written stub carries are
+`shouldMarkCookieSecure` and `resetCookieSecurityWarning`:
+`grep -rn 'shouldMarkCookieSecure' tests/` returns exactly one hit, and it is a sentence in a comment
+rather than a stub key, while `resetCookieSecurityWarning` appears only in
+`tests/unit/lib/auth.test.ts`, which imports the real module.
+`src/app/api/auth/oidc/login/route.ts` imports `shouldMarkCookieSecure` and awaits it to decide the
+auth cookie's `secure` flag, so every one of those stubs is already an export short of the module it
+replaces. Nothing has hit that yet only because `tests/api/auth/oidc-login.test.ts` is one of the
+route tests that does NOT mock `@/lib/auth`.
+
+Nothing can catch it either. `mock.module` is declared `module(id: string, factory: () => any)` in
+`node_modules/bun-types/test.d.ts`, so a stub that has drifted from the module it stands in for is
+invisible to `bun run typecheck`, and the drift can only show up as a `TypeError` in whichever route
+reaches the missing export first.
+
+Per-file process isolation does nothing about this and was never meant to. The runner gives each
+file its own process, so a stub can no longer reach a sibling that wants the real module. What a
+process boundary cannot do is make the stub the right SHAPE.
+
+**Done when:** one factory in `tests/helpers/`, typed `(): typeof import("@/lib/auth")`, replaces the
+hand-written stubs, so adding an export to `src/lib/auth.ts` fails `typecheck` in every file that
+mocks it instead of at run time in one of them. The same shape then covers the other layer-wide
+mocks, `@/lib/db` in fifteen files and `@/lib/audit` in four.
+
+### D86. `bun test --isolate` has not been re-probed, and the runner pays a process per test file
+
+`tests/run-tests.ts` spawns one bun process per test file, 549 of them on 2026-09-15, because
+`mock.module()` is process-wide with no undo and whole-module mocks are a whole layer's standard
+pattern. That is what it costs, measured on Linux with 20 cores and bun 1.4.2 earlier the same day,
+over the 538 files the tree held then: 211 seconds one file at a time, 61 seconds 4 at a time, 36
+seconds 20 at a time, and about 60 seconds at 8 with coverage on. `README.md` carries the same three
+timings against the same 538 files.
+
+bun 1.4.2 has `--isolate`, which resets the module registry per file inside ONE process and does
+contain `mock.module`. If it were reliable here, the runner could start a handful of processes
+rather than one per file. It is not adopted because of oven-sh/bun#41655, a NAPI finalizer SIGSEGV
+that reproduces serially on 1.4.2, and this suite loads three NAPI addons: `better-sqlite3`,
+`oracledb` and `@duckdb/node-api`. `docs/TOOLCHAIN.md` records the same refusal, beside the one for
+`--parallel`.
+
+**Done when:** #41655 is closed and a probe has run the whole suite under `--isolate` twenty
+consecutive times on each of Linux, macOS and Windows with no crash, no leaked subprocess and the
+same per-file pass counts as the process-per-file runner, after which the runner may take it - or
+the probe reproduced a failure and this entry is replaced by what it reproduced. A mode that is
+flaky at this size is worse than a slow one, because its failures arrive wearing the tests' own
+clothes.
+
+### D87. Two packaging tests cannot run on Windows because the scripts they drive shell out
+
+Measured 2026-09-15, while making `bun run test` green on all three platforms. Two tests now declare
+a platform or tool requirement and say so in their own title, and in both cases the requirement comes
+from the script under test rather than from the test:
+
+- `scripts/build-azure-package.mjs:273` builds the marketplace archive with `execFileSync("zip", ...)`.
+  A stock Windows 11 machine has neither `zip` nor `unzip`, so `tests/unit/build-azure-package.test.ts`
+  gates its build cases on both binaries. Writing the two-file archive with a pure JavaScript zip
+  writer would make the Azure package reproducible everywhere and let the test read the archive back
+  in process, which is what it already does for the standalone zip since this change.
+- `scripts/ci-install.sh` is the bun install retry policy used by every workflow, and
+  `tests/unit/ci-install.test.ts` drives it with a fixture PATH holding two `chmod 0755` stubs.
+  Windows has no exec bit and no shebang dispatch, so the whole file is skipped there. The policy is
+  twenty lines of arithmetic and `bun install`; as `scripts/ci-install.mjs` it would run under the
+  same `shell: bash` steps and be testable on every platform.
+
+Neither is a correctness defect today: CI runs both on Linux, and the skips are declared rather than
+silent. What they cost is that a Windows contributor cannot verify a change to either script.
+
+**Done when:** the Azure package is written without an external archiver, `ci-install` is a script bun
+or node can run, and both test files run unconditionally on all three platforms.
+
+### D95. The runner's default concurrency reads the CPUs and never the memory limit
+
+Measured 2026-09-15 on Linux x64 with 20 cores and bun 1.4.2, while reviewing #837.
+`tests/run-tests.ts` passes `availableParallelism()` to `parseRunnerArgs`, which makes the default one job per available CPU.
+That much already behaves: `availableParallelism()` in bun 1.4.2 follows CPU affinity and a cgroup v2 CPU quota, measured as 2 under `taskset -c 0-1` and 2 under `systemd-run --property=CPUQuota=200%`, so a container with a CPU limit is sized by it.
+A container with a MEMORY limit and no CPU limit on a many-core host is not, and that is the case that fails: `docker run --memory=2g` on a 64-core host starts 64 jobs.
+
+What a job costs, measured over a 32-file sample run one at a time under `/usr/bin/time`, in peak RSS: minimum 58 MiB, median 100 MiB, p90 199 MiB, maximum 341 MiB.
+Under real concurrency the files do not peak together, so the marginal cost is lower: the runner over `tests/components` peaked at 599 MB with 4 jobs, 998 MB with 8 and 1599 MB with 16, a slope of about 80 to 90 MiB per extra job over a fixed 300 MB.
+The largest run actually made was 16 jobs, so 64 jobs is 5 to 6 GiB extrapolated from that slope rather than measured, and 12.4 GiB if every file peaked at the p90 bound at once, against a 2 GiB limit.
+Under Kubernetes or systemd the whole run is then killed rather than one file: measured before this branch handled SIGTERM, a run stopped by systemd's default `OOMPolicy` ended at exit 143 with no summary and its scratch directory left behind, and it now ends at the same 143 with `Interrupted (SIGTERM).`; under Kubernetes's `memory.oom.group` the kernel SIGKILLs the runner too, so nothing is printed at all (reasoned, not measured).
+Neither shape names the file that ran the container out of memory, which is what a memory-aware default would prevent rather than explain.
+
+Which API can carry the limit was measured too, and only one of the three can.
+`process.constrainedMemory()` follows a cgroup v2 `memory.max` (2147483648 under `MemoryMax=2G`) and equals `os.totalmem()` when there is no limit, which makes it usable with no fallback branch.
+`process.availableMemory()` does NOT: inside the same 2 GiB scope it returned the host's 34 GB, unlike node 24, which follows the cgroup there.
+`os.freemem()` is not a budget at all, since it moves with unrelated load and leaves out reclaimable page cache.
+Not measured: what `constrainedMemory()` returns on macOS and on Windows, where there is no cgroup for bun to read; reasoned, it should be total RAM, and that is what the entry rests on.
+
+A fixed cap is the wrong shape and was rejected: `Math.min(cpuCount, 16)` still needs 1.6 to 3.1 GiB inside a 1 GiB container, and it caps a workstation on a constant nobody measured against memory.
+What this PR did instead is make the failure readable: a file killed by SIGKILL from outside the runner now names the OOM killer and `--jobs=N` in its reason, `CONTRIBUTING.md` says when to pass it, and `docs/TOOLCHAIN.md` carries these numbers.
+
+The shape it would take: `parseRunnerArgs`'s injected context grows from `{ cpuCount }` to `{ cpuCount, memoryBytes }`, `tests/run-tests.ts` passes `process.constrainedMemory()`, and the default becomes
+`Math.max(1, Math.min(cpuCount, Math.floor(memoryBytes / JOB_MEMORY_BUDGET_BYTES)))`.
+A budget of 256 MiB is the one this measurement supports: above the p90 per-file peak of 199 MiB and about three times the concurrent slope.
+A 2 GiB limit would then give 8 jobs, where 8 measured 940 MiB of anonymous memory, and the measured host, whose `constrainedMemory()` is 67,118,133,248 bytes (64 GB, 62.5 GiB), would give 250, so the CPUs stay the binding constraint everywhere else.
+An explicit `--jobs=N` must still win over it, and the budget is a constant that drifts as the suite grows, so its docblock has to carry the basis above.
+
+**Done when:** `parseRunnerArgs` takes a memory budget beside the CPU count, `tests/unit/test-runner-options.test.ts` pins the four cases (64 CPUs with 2 GiB gives 8, 8 CPUs with 64 GiB gives 8, 4 CPUs with 100 MiB gives 1 and never 0, and an explicit `--jobs=32` wins over all of it), and a CI run on macos-latest and windows-latest has printed `process.constrainedMemory()` against `os.totalmem()` so the unmeasured half of the premise is measured rather than reasoned.
+
+### D96. bun 1.4.2 drops part of a child's own console output when the child exits under load
+
+Measured 2026-09-15 on Linux x64 with 20 cores and bun 1.4.2, while reviewing #837.
+A test file that prints a megabyte and then fails does not always get that megabyte to whoever is reading the run: the bytes are lost by the child `bun test` process at its own exit, before anything the runner can drain.
+A fixture printing 1024 lines of 1023 bytes, run 20 times with the machine deliberately loaded, lost output in 15 of the 20 runs and delivered as few as 182 of the 1024 lines; unloaded, 10 of 10 runs were whole.
+The loss is not the runner's pipe: with the runner's own stdout redirected to a FILE, 3 of 10 loaded runs still lost 15 to 40 per cent of the file's output, and with no runner in the picture at all, `bun test ./fixture.test.ts 2>/dev/null | cat > out` under load delivered 126 of 1024 lines in 1 of 10 runs.
+
+What the runner does guarantee is its own last lines: the summary, the `Failed files:` block and the re-run hint are written through a drain that waits for the bytes to leave the process, and those survived every one of those runs.
+So the cost is a contributor reading a red CI log from a busy machine and getting a truncated failure diff under an accurate verdict, not a wrong verdict.
+`tests/unit/test-runner-cli.test.ts` states this where it would otherwise be tempting to assert the whole output back: its megabyte case asserts the verdict, the summary and that the file's output reached stdout at all, and says in a comment why it cannot assert the line count.
+
+There is nothing to fix inside this repository: the queue that is dropped belongs to the child process.
+What can be done is to re-probe, and to stop the claim drifting back to "whole output" in the meantime.
+
+**Done when:** the focused repro has been run against a bun newer than 1.4.2 under the same load, and either it is whole 10 times out of 10 and this entry closes, or the entry names the newest version it still reproduces on and is reported upstream.
+
+### D99. The MariaDB flavour write is hand-copied into four declaration suites
+
+`MySQLProvider` resolves its object kinds from a private `measuredFlavour` that `connect()` writes
+from a server-version probe, so a suite that wants the MariaDB branch without a server writes the
+private field through a cast.
+Four files in `tests/isolated/` now carry the same `MARIADB_FLAVOUR` constant and the same
+`(provider as unknown as { measuredFlavour: "mysql" | "mariadb" }).measuredFlavour = MARIADB_FLAVOUR`
+line: `monaco-language-ids.test.ts`, `object-source-declarations.test.ts`,
+`object-edit-declarations.test.ts` and `object-column-declarations.test.ts`.
+
+Each of the first three disclosed the copy in its docblock rather than hoisting it, citing the
+standing ruling that a second copy is disclosed and a helper is earned; the fourth followed suit
+during the #789 column census and said so.
+Four is past that point.
+The cast is the part that matters: it names a private field's type in four places, so a rename of
+`measuredFlavour` or a third flavour compiles everywhere and silently stops driving the MariaDB
+branch in all four suites at once, and the census guards there would then be measuring MySQL while
+their names say MariaDB.
+
+Repro: rename `measuredFlavour` in `src/lib/db/providers/sql/mysql.ts` and run `bun run typecheck`.
+The four casts still compile, because a cast through `unknown` asserts a shape rather than checking
+one.
+
+**Done when:** one helper beside `tests/helpers/census-connection.ts` owns the constant and the
+write, the four suites call it, and the helper's own test fails when the private field it writes no
+longer exists on the provider.
+
+### D100. Five dead fixture arms in the SQL Server suite model a method that was removed
+
+`tests/integration/db/mssql-provider.test.ts` dispatches its double on statement text, and five arms
+answer for a `getSchema()` shape that no longer exists: `flat-tables`, `flat-columns`, `flat-pk`,
+`flat-fks` and `flat-indexes`.
+`src/lib/db/base-provider.ts` records that removal.
+
+They were not merely dead, they were live and wrong.
+During the #789 column census the single-object index statement fell into the `flat-indexes` arm,
+which answers a canned `app_orders_total_ix` row for any object, and the suite fabricated an index on
+`app.order_summary` the moment that object gained column rows.
+The arm's guard was narrowed with `T.NAME AS TABLE_NAME`, the same fragment the neighbouring
+`flat-pk` arm already uses, so the defect is fixed and all five arms are now unreachable.
+
+Repro: delete the five `case` bodies and their five `if` guards and run
+`bun tests/run-tests.ts tests/integration/db/mssql-provider.test.ts`.
+If the suite is green, nothing reached them.
+
+**Done when:** the five arms are gone, or the one that is still reachable is named with the statement
+that reaches it, and the suite is green either way.
+
+### D101. A `columnlessSamples` reason is not held to the bar `emptyKinds` sets
+
+`tests/helpers/object-surface-conformance.ts` takes two exemption maps whose values are reasons a
+person reads.
+`emptyKinds` holds its reasons to a bar: a blank sentence is refused, and the verdicts in
+`NOT_A_REASON` ("not applicable", "n/a", "none", "todo") are refused with a sentence saying to write
+what is absent and why.
+`columnlessSamples`, added by the #789 census so a provider may declare a kind has columns while a
+fixture's sampled object has none, is checked only for having excused something.
+So `columnlessSamples: { collection: "" }` and `columnlessSamples: { collection: "n/a" }` both buy the
+exemption, and the invariant that a declared twisty never opens on nothing is then waived by a string
+that states no fact.
+
+Repro: in any provider suite whose expectation carries a `columnlessSamples` entry, replace the reason
+with `"n/a"` and run that suite. It stays green.
+
+**Done when:** a `columnlessSamples` reason passes the same blank and `NOT_A_REASON` checks
+`emptyKinds` reasons pass, with the two negative cases asserted, and the two maps share one reason
+checker rather than two copies of it.
+
+### D102. PostgreSQL reports no primary key and no foreign key to a least-privilege role
+
+`CTE_PK_INFO` and `CTE_FK_INFO` in `src/lib/db/providers/sql/postgres.ts` read
+`information_schema.table_constraints`, which PostgreSQL defines as showing only constraints on
+tables a currently enabled role owns.
+A connection made as an ordinary `SELECT`-only role therefore sees every column and every index and
+NO key at all, and the answer is a claim rather than an absence: `describeObject` returns
+`isPrimary: false` on every column and `foreignKeys: []`.
+
+That role is not a corner case, it is what this product recommends and what its own seed fixture
+uses.
+The blind spot predates the object tree and is not confined to it: both CTEs feed `OBJECT_DETAIL_SQL`
+and the bulk statement beside it, so the ER diagram, the mobile schema explorer and the inventory's
+`includeColumns` answer have carried it too.
+What the object tree changed is that the key mark is now on screen, where an absent key reads as a
+table without one.
+
+Measured 2026-09-22 against PostgreSQL 18 holding `dvdrental`, `public.film`, tables owned by
+`postgres`, probed through `POST /api/db/objects/describe`:
+
+| Connected as | Columns | Primary key | Foreign keys |
+|---|---|---|---|
+| `postgres`, the owner | 13 | `film_id` | 1 |
+| `libredb_agent`, `SELECT` only | 13 | none | none |
+
+And at the catalog, as `libredb_agent`: `information_schema.table_constraints` answers 0 rows for
+`constraint_type = 'PRIMARY KEY'` in `public` while `pg_constraint` answers 15, and
+`information_schema.referential_constraints` answers 0 while `pg_constraint` answers 18 foreign keys.
+`information_schema.columns` answers 128 and `pg_indexes` answers 32 to the same role, which is why
+only the keys go missing.
+
+The repair is `pg_catalog`, which `CTE_INDEX_INFO` beside them already reads, and it is not a local
+edit: both statements run against every PostgreSQL wire-compatible engine this repo measures, and one
+of them, Materialize, already needs the documented `constraint_column_usage` fallback that
+`tests/integration/db/postgres-provider.test.ts` pins. So the change owes a live measurement on
+Materialize, CockroachDB, YugabyteDB and RisingWave before it lands, which is why it is filed rather
+than folded into #789's column work.
+
+Repro: connect Studio to any PostgreSQL as a role that owns nothing and holds only `SELECT`, expand a
+table in the object tree, and read the column rows. No key mark appears. Connect as the owner and it
+does.
+
+**Done when:** a `SELECT`-only role sees the same keys the owner sees, on PostgreSQL and on every
+wire-compatible engine whose fallback behaviour was measured for the change, with a test that drives
+the provider as a non-owner role rather than asserting the statement text.
+
+### D103. `noAbstainingKinds` is enforced over the expectation's kinds, not the provider's declarations
+
+`assertColumnDeclarations` builds `abstained` by walking `listings`
+(`tests/helpers/object-surface-conformance.ts:595-603`), and `listings` holds only the kinds the
+expectation gave a non-zero `want` (`:307-335`). The field's own docblock (`:195-200`) defines it
+over something else: "This provider declares `hasColumns` on EVERY kind it has". A provider that
+declares one kind without `hasColumns` and whose fixture happens to hold none of that kind is
+therefore indistinguishable, to the guard, from a provider that has no abstaining kind at all, and
+the refusal at `:643` tells the author to set a flag whose stated meaning that provider's own
+declarations contradict.
+
+It is worse than one wrong direction, and the control that shows it is the one worth keeping.
+Omitting the declared abstainer from the expectation is refused too. A fake provider declaring
+`table` (with columns, answering columns) and `trigger` (abstaining) throws the same
+"listed no kind that abstains from hasColumns" whether `trigger` is listed with a `want` of 0 or left
+out of `expected.kinds` entirely, and the only way to green it is to set `noAbstainingKinds`. So the
+expectation has no form in which it can state the truth about that provider, and the guard's advice
+is to record a falsehood.
+
+No shipped engine trips it today, re-checked across all seventeen expectations: druid, mongodb and
+libredb set the flag correctly, and Trino's only zero-counted kind, `materialized_view`, declares
+`hasColumns` and so is not an abstainer. This is a guard that refuses a legal provider, not a live
+red.
+
+Repro: take any expectation, add a kind the provider declares without `hasColumns` with a `want` of
+0, run it, then delete that kind from `expected.kinds` and run it again. Both throw the same message.
+
+Splitting the flag into two variables, the declaration fact and the fixture fact, is necessary and
+not sufficient. After the split a declared-but-unlisted abstainer still runs the negative probe zero
+times, which is the vacuity the flag was added against, so the complete repair needs a third state:
+the probe ran, or the expectation says why it could not.
+
+**Done when:** `abstained` is derived from the provider's own `objectKinds()` rather than from
+`listings`, an expectation that omits a declared abstaining kind is refused by name instead of by the
+flag's message, a flag set against declarations that contradict it is refused, and the negative
+direction of invariant 8 reports whether it ran rather than only whether it could have.
 ## Value interpolation
 
 ### V1. Query history records the placeholders, not the values that were bound
@@ -572,12 +1579,66 @@ Whether row editing should be universal at all is a product decision. The publis
 `WorkspaceFeatures.inlineEditing` flag is deprecated against this entry (#288): it becomes real, or
 goes away in a major, with this work.
 
+### R2. A MySQL index hint refuses an inline edit that the tab title used to write
+
+`resolveUpdateTarget` (`src/lib/sql/update-target.ts`) reads the FROM reference as a name, an
+optional `AS`, and an optional alias, and refuses everything longer through its trailing catch-all.
+A MySQL index hint is longer: measured, `resolveUpdateTarget("SELECT * FROM users USE INDEX (idx)
+WHERE id = 1", "mysql")` answers "This query describes its table in a way this editor cannot read".
+The same applies to `FORCE INDEX` and `IGNORE INDEX`.
+
+It reads exactly one table, and the tab-title reader #881 replaced wrote it correctly, so inline
+editing on such a tab goes from working to refused. It is a refusal rather than a wrong write, which
+is the direction that module chooses everywhere, so it is recorded rather than rushed.
+
+Done looks like: the hint is read and dropped, the table resolves, and a hint naming a second table
+(there is no such form on MySQL, which is what makes this safe) stays refused. Tests belong beside
+the LIMIT case in `tests/unit/sql/update-target.test.ts`, with the engine each shape was measured on.
+
+---
+
+### R3. A whole-LOOKING key out of a scaled decimal column writes the neighbouring row
+
+#969 closed the fractional half of this: a number read out of a column the engine declares `NUMBER`,
+`decimal`, `numeric` or `money` is refused before the engine is asked, because the declaration says
+the driver rounded it - `describeFraction` and `EXACT_DECIMAL_TYPE_NAMES` in
+`src/hooks/use-inline-editing.ts`. Measured 2026-09-19 on Oracle AI Database 26ai Free 23.26.3.0.0
+and SQL Server 2022 CU27: the `NUMBER(20,4)` pair that used to write to `the-neighbour` is refused
+with nothing asked of the engine, while `BINARY_DOUBLE`, a whole `NUMBER(10)` key, a SQLite
+`DECIMAL` (that engine has no exact decimal - it stores a double) and the STRING a `numeric` takes
+over `pg`, mysql2 and DuckDB all still write.
+
+**What is left is the value that arrives WHOLE.** A decimal whose digits round to an exact integer
+double reaches `describeUncarriableKey` as a safe integer and is let through - which is right for
+every ordinary Oracle key and wrong for this one. MEASURED 2026-09-19 through this hook, after the
+fix above: Oracle `zz969_intx(id NUMBER(38,20) PRIMARY KEY)` holding 5.00000000000000000001 and 5
+hands BOTH rows over as 5; with only the first row edited, the check asked about 5, Oracle answered
+ONE group holding ONE row, and `UPDATE ... WHERE "ID" = :2` wrote to the row holding exactly 5 -
+the row nobody edited - reported as "Changes Applied". SQL Server `decimal(38,20)` over the same
+pair does the same thing, the parameter bound as an integer this time rather than a float.
+
+It could not be closed where the fractional half was. The only thing that separates `NUMBER(38,20)`
+from the `NUMBER(10)` that is every second Oracle primary key is the SCALE, and the declared type
+this hook reads carries the word alone: `oracleColumnTypes` and `mssqlColumnTypes` in
+`src/lib/db/providers/sql/column-types.ts` drop precision and scale deliberately, because a computed
+column reports precision 0 (`COUNT(*)`) or scale -127 (`1/3`). Refusing every whole number out of a
+decimal column instead would refuse every Oracle key there is - measured, `NUMBER(10)` holding 42
+writes correctly and must keep doing so.
+
+**Done when:** the type that reaches this hook says whether the column can hold digits under the
+point on the engines whose drivers round - the scale beside the word, or a second field that says
+it - a whole key is refused only where it can, and a test carries the Oracle and SQL Server pairs
+above beside the fractional ones #969 added.
+
 ---
 
 ## Studio UI and query execution
 
-`U2` came out of the #384 review. The `X` entries came out of the #422 export review — each was
-named, weighed and left out of that PR, so they are recorded rather than re-derived.
+`U2` came out of the #384 review. `X2` to `X13` came out of the #422 export review: each was
+named, weighed and left out of that PR, so they are recorded rather than re-derived. `X14` and `X15`
+came out of the #789 object-source design's own measurement passes: both are pre-existing, neither
+is in the seam that epic touches, and both were re-measured against the tree before being written
+here.
 
 ### X2. An export writes the page the grid holds, not the result the user asked for
 
@@ -601,7 +1662,8 @@ it was not mixed into a correctness PR.
 
 ### X9. What `columnTypes` still cannot name, measured
 
-The four string-returning drivers fill `QueryResult.columnTypes` since 2026-08-23. Four bounds were
+The four string-returning drivers fill `QueryResult.columnTypes` since 2026-08-23, and
+SQLite joined them on 2026-09-18 by reading its own declarations through the driver bridge. Four bounds were
 measured while doing it, and each is a small residue rather than a defect:
 
 - **A user-defined type has no name.** Postgres's built-in OIDs are a generated static table (they are
@@ -651,6 +1713,134 @@ and calling that lossless would be a lie.
 reader can act on, proven by replaying a `jsonb` and a `json` result into ClickHouse, Trino and
 Cassandra.
 
+### X13. Profile is withheld from two engines by an engine-wide flag, and LibreDB has named objects behind it
+
+`row-actions.ts:146` gates Profile on `capabilities.tablesAreDerivedGroupings !== true`, which is a
+PROVIDER fact, while every other gate beside it is a per-kind declaration. The flag says "the rows
+this engine shows are prefix groupings this server derived from a bounded scan", and on Redis that
+is true of every row it has. On LibreDB it is true of one kind out of three: `keyspace` is derived,
+while `table` and `collection` are entries the persisted catalog NAMES, created by `table()` and
+`doc()` and addressed by the name their author chose (#789, Task 23). Those two are refused Profile
+purely because the gate never got a per-kind half.
+
+Nothing regresses today and that is measured, not assumed: `POST /api/db/profile` branches on
+`queryLanguage === "sql"` and this provider declares `json`, so a profile of a LibreDB table is sent
+as a MongoDB aggregate pipeline and the grammar answers
+`Unknown command ... Supported: get, put, delete, prefix, range`. Profile cannot work on ANY kind
+here, so withholding it from all three is the honest menu rather than a cost. That is pinned by a
+test in `tests/integration/db/libredb-provider.test.ts`.
+
+The condition that makes it bite is a separate fact changing: the day the profile route grows an arm
+for this engine's grammar, two named-object kinds stay silently refused with no declaration
+recording why, and the reason will read as a Redis decision rather than a LibreDB one. The same
+would happen to any future engine that sets the flag while holding cataloged objects.
+
+**Done when:** the per-kind half exists - a kind-level declaration saying whether a kind's rows are
+derived groupings, read beside the engine-wide flag the way `kindAcceptsRowWrites` is read beside
+`supportsInlineRowEdit` - or the engine-wide gate is deliberately kept with that decision written at
+`libredb.ts`'s `tablesAreDerivedGroupings` site and in `docs/providers/libredb.md`. Either way
+LibreDB's `table` and `collection` stop being refused by a flag that was never about them.
+
+### X14. The workspace write that persists every tab has no quota guard
+
+`src/hooks/use-tab-manager.ts:213` writes the whole workspace with
+`storage.setItem(workspaceKey, JSON.stringify(serialized))` inside a 500 ms `setTimeout`, with no
+`try`/`catch` anywhere between the timer callback and the call. Every other localStorage writer in
+this application already has one: `src/lib/storage/local-storage.ts:64` and `:82` both wrap their
+`setItem`, log `Failed to write to localStorage` and answer `false`, so the guard is a pattern this
+writer skipped rather than a pattern nobody has.
+
+The quota it writes against is shared. `STORAGE_COLLECTIONS` (`src/lib/storage/types.ts:28-38`) is
+ten collections, connections and history and the audit log among them, and all of them plus this
+record live inside one origin quota of about 5 MiB. The record itself is unbounded from the shell's
+point of view because `PersistedTabState.query` copies each tab's editor text verbatim.
+
+The symptom is not a lost tab. A `QuotaExceededError` thrown inside a timer callback is not caught
+by React and not caught here, so it reaches the window's error handler, tab persistence stops for
+the WHOLE workspace, and nothing tells the user; the next tab change schedules the same timer and
+throws again. Found while designing #789 and not fixed there, because Phase 2 touches this record
+only to add one address-only field: a Source tab persists its `path` and `kind` and never one
+character of the definition it read, for exactly this reason, which narrows the exposure and closes
+nothing. The reasoning is in the `PersistedTabState` docblock at `use-tab-manager.ts:40-60`.
+
+**Done when:** the write is guarded the way `local-storage.ts` guards its own, and the failure is
+observable rather than swallowed - a user whose workspace has stopped persisting is told, since a
+silent `false` here means the tabs on screen are no longer the tabs that will come back.
+
+### X15. The studio tab bar is half the WAI-ARIA tabs pattern
+
+`StudioTabBar.tsx` has the tab half and none of the panel half. Measured 2026-09-13: `:98` is
+`role="tablist"` with `aria-label="Editor tabs"`, `:150-153` gives every tab `role="tab"`,
+`aria-selected` and a roving `tabIndex`, and `:72-79` implements Arrow, Home and End activation. No
+tab carries `aria-controls`, and no element in either shell carries `role="tabpanel"`: the region
+the tabs actually govern is the bare `<main className="flex-1 overflow-hidden relative">` at
+`src/components/Studio.tsx:777` and at `src/workspace/StudioWorkspace.tsx:494`.
+
+So a screen reader announces the tab and its selected state and can never say which region the tab
+governs, and there is no way to move from a tab to its content.
+
+The basis for the "nowhere in `src/`" form of this claim has moved and the entry says so rather than
+repeating it: `grep -rn 'tabpanel' src/` now returns exactly one hit,
+`src/components/object-source/ObjectSourceView.tsx:347`, which is the Source view's own part
+switcher added by #789. The pattern is bare on purpose: that role is written as an object property,
+`{ role: "tabpanel", ... }`, and never as a JSX attribute, so grepping the attribute form matches
+nothing, which would read as an absence that is not there. The switcher is the complete pattern,
+including the rule the studio bar will need: only the SELECTED tab may carry `aria-controls`,
+because only the active panel is in the tree and a reference to an absent element is an
+`aria-valid-attr-value` violation of its own.
+
+It is not a one-line fix, which is why it is here. The panel is ONE element shared by every tab, so
+its `id` has to key on `activeTabId`, and the same element is the mount point for the schema diagram
+overlay, which is not the tab's content at all. Both shells render the bar, so the fix lands twice
+and is verified twice.
+
+**Done when:** the editor region carries `role="tabpanel"`, an id derived from `activeTabId` and
+`aria-labelledby` naming the selected tab, the selected tab alone carries the matching
+`aria-controls`, and both shells are checked, since a UI change verified in one is not verified in
+the other.
+
+### X16. Opened at `127.0.0.1`, the dev server serves a page that never becomes interactive
+
+MEASURED on 2026-09-13 against Next.js 16.3.4 with Turbopack, in two independent browsers
+(Playwright's Chromium and Chrome over CDP), while doing the browser QA for #789.
+
+`bun dev` prints `http://localhost:<port>`. Open the SAME server at `http://127.0.0.1:<port>`
+instead and the page renders its server HTML and then does nothing at all: no button responds, the
+login form submits natively to `/login?` and clears itself, and `POST /api/auth/login` is never
+made. `Object.keys(document.querySelector('#email'))` carries no `__react*` key, so React never
+hydrated. The only console output is one repeated
+`WebSocket connection to 'ws://127.0.0.1:<port>/_next/hmr' failed: Error during WebSocket
+handshake: net::ERR_INVALID_HTTP_RESPONSE`.
+
+THE CAUSE IS THE DEV SERVER'S OWN ORIGIN CHECK ON THAT SOCKET, isolated with a control rather than
+inferred. The same upgrade request, differing only in one header, run from the shell:
+
+| Request to `/_next/hmr` | Answer |
+| --- | --- |
+| no `Origin` header | `HTTP/1.1 101 Switching Protocols` |
+| `Origin: http://localhost:<port>` | `HTTP/1.1 101 Switching Protocols` |
+| `Origin: http://127.0.0.1:<port>` | the connection is closed with no HTTP response at all |
+| `Origin: http://192.168.1.66:<port>` | the connection is closed with no HTTP response at all |
+
+That empty answer is what the browser reports as `ERR_INVALID_HTTP_RESPONSE`, and the dev client's
+bootstrap does not survive it. The chain closes both ways: served by the same process at the same
+moment, `http://localhost:<port>/login` hydrates and `http://127.0.0.1:<port>/login` does not.
+
+Next 16 has a configuration key for exactly this and this repository sets none:
+`grep -rn 'allowedDevOrigins' src/ next.config.ts` returns nothing. The production path is
+unaffected, measured: `bun run build` plus `bun run start` hydrates at `127.0.0.1` and every part of
+#789's browser pass ran there.
+
+It is filed rather than fixed because the value is a decision rather than a typo. The key names the
+origins a developer's browser may drive the dev server from, so widening it widens a control Next
+added deliberately, and `127.0.0.1` and a LAN address are not the same call. The cost of leaving it
+is a developer who types the loopback address, or opens the LAN URL `bun dev` also prints, meeting a
+dead page with one obscure console line.
+
+**Done when:** `bun dev` opened at `127.0.0.1` and at the LAN address the banner prints is
+interactive, either by configuring `allowedDevOrigins` or by not printing a URL that does not work,
+and a note in `docs/TOOLCHAIN.md` records which and why.
+
 ---
 
 ### U2. The rule that catches an arity change on a JSX handler is configured but not aimed at components
@@ -695,6 +1885,365 @@ is not a free read.
 recorded reason it is withheld.
 
 ---
+
+### X18. The add-connection button has no accessible name
+
+MEASURED 2026-09-13 in a browser: the icon-only button beside `Show ERD Diagram` carries no `title`, no
+`aria-label` and no text content, while its neighbour carries one.
+
+`jsx-a11y` is a hard oxlint gate in this repo and this survived it, so the finding is two things: the
+button, and the fact that the rule in force does not cover an icon-only button with an SVG child. Fixing
+only the first leaves the next one to be found by hand.
+
+**Done when:** the button has an accessible name, and the lint rule that should have caught it either
+covers this shape or is recorded as not covering it.
+
+### X19. A body the framework truncated is reported as an empty body on five routes and as a parser error on a sixth
+
+Next 16.3.4 CLONES every request body for middleware, and this repository has middleware (`src/proxy.ts`),
+so `DEFAULT_BODY_CLONE_SIZE_LIMIT` in `node_modules/next/dist/server/body-streams.js` applies to every
+route. It TRUNCATES at exactly 10,485,760 bytes rather than refusing, and `next.config.ts` sets no
+`middlewareClientMaxBodySize`.
+
+MEASURED and bisected on 2026-09-14 against `POST /api/db/query`:
+
+```
+body 10485760 bytes -> HTTP 200, the statement ran
+body 10485761 bytes -> HTTP 500 {"error":"Expected ',' or '}' after property value in JSON at position 10485760 ...","code":"INTERNAL_ERROR"}
+body 10485900 bytes -> HTTP 500 {"error":"Unterminated string in JSON at position 10485760 ...","code":"INTERNAL_ERROR"}
+```
+
+The server log names it in Next's own words: `Request body exceeded 10MB for /api/db/query. Only the
+first 10MB will be available unless configured.`
+
+So one condition gets two wrong answers. The five existing object routes that go through
+`handleObjectRequest`'s body-parse arm answer HTTP 400 `{ "error": "Empty request body" }` for a body that
+was neither empty nor malformed, and `POST /api/db/query` answers HTTP 500 with a JSON parser's sentence.
+Neither tells the caller their request was too large.
+
+The two routes added by #789 Phase 3 do NOT inherit this: `readBoundedJson` reads `content-length` and
+answers 413 above `EDIT_BODY_BYTE_LIMIT` (8,388,608), which sits below the framework's wall, so an
+oversized edit body meets a sentence that names the size. They do not fix it anywhere else, and that is
+stated in `readDefaultBody`'s own docblock.
+
+**Done when:** a body above the framework's clone limit gets one answer that names the size, on every
+route, rather than an empty-body claim on five and a parser error on one.
+
+---
+
+`U24` to `U31` came out of the #789 design that put columns back under an object row. Each was named
+and left out of that PR on purpose, so the reason is recorded here rather than re-derived. They are
+about the desktop object tree unless the entry says otherwise.
+
+### U24. The tree fetches an object's indexes and foreign keys and draws neither
+
+`POST /api/db/objects/describe` answers an `ObjectDetail`, which is `columns`, `indexes` and
+`foreignKeys`.
+The tree issues one of those per expanded object row and renders the first array only, so two thirds
+of every answer it already paid for is discarded.
+
+Repro: connect to PostgreSQL in the desktop sidebar with the network panel open, expand a table that
+has a primary key and a foreign key.
+One `describe` request goes out, its response body carries all three arrays, and the rows drawn under
+the table are the columns alone.
+
+Left out of #789 for two reasons, both still standing.
+A heterogeneous sibling list where an index row and a column row are one 28px line with no way to
+tell them apart is worse than not drawing them, so this needs a visual distinction decided first, not
+a second `map`.
+And a set of providers never answers an index at all, measured per provider for the #789 design:
+trino, druid, elasticsearch and opensearch (one module, two type-ids), mongodb, redis and libredb.
+So whatever shape holds an index has to be absent on those engines rather than empty.
+
+**Done when:** an index and a foreign key are reachable from an open object row, told apart from a
+column row by something other than their text, with no extra round trip, and an engine that answers
+neither draws no empty affordance for them.
+
+### U25. The object tree has no filter, over object names or column names
+
+`docs/FEATURES.md` promises "Real-time, high-performance filtering across both table names and column
+names".
+That sentence is true of `SchemaExplorer`, which filters on `table.name` and on `col.name` and is
+what the mobile schema tab renders; it is false of the desktop sidebar, which has no filter box at
+all.
+This PR scoped the sentence to the schema tab rather than deleting it, which makes the desktop gap
+explicit instead of covered.
+
+Repro: open the desktop sidebar on a schema with 200 tables and look for a filter.
+Open the same connection at a mobile width, switch to the schema tab, and there is one.
+
+The tree's filter is not the flat list's, and that is the work.
+The flat list holds every table and every column in memory, so its filter is an array filter over
+data that is already there.
+The tree reads lazily: a filter over column names can only match a row whose `describe` has happened,
+and a filter over object names can only match a folder whose objects have been listed.
+What an unread subtree does under a filter has to be decided before anything is written, and the
+three answers are hide it, show it unfiltered, or read it, where the third is the eager
+whole-database read #789 removed.
+
+**Done when:** the tree has a filter over object and column names, its behaviour on an unread subtree
+is stated in the component's docblock and asserted by a test, and no keystroke in the box can trigger
+a whole-database read.
+
+### U26. The tree row menu is two items shorter than the flat explorer's
+
+`src/components/schema-explorer/TableItem.tsx` offers "Select Top 50" (the label is
+`labels.selectAction` where a provider sets one), "Generate Query" and "Copy Name".
+`rowActions` in `src/components/object-tree/row-actions.ts` offers `generate-select` and neither of
+the other two, so a desktop reader lost both when the sidebar stopped rendering the flat explorer.
+
+Repro: right-click a table row in the desktop sidebar, then open the same table's menu on the mobile
+schema tab and compare.
+
+"Copy Name" has a constraint that has to be decided before it is added, and it is the reason this is
+an entry rather than two lines.
+It writes the clipboard and reports through a toast, and the embedded shell mounts no `<Toaster />`,
+for the reason `StudioWorkspace` records; the standalone shell mounts one in `src/app/layout.tsx`.
+So the action either gets a report the embedded shell can make, or it is declared standalone-only the
+way the seam already declares other host-dependent actions, and silently copying with no feedback is
+neither.
+
+**Done when:** both items are offered from a tree object row wherever the shell can carry their side
+effect, and a shell that cannot carry one declares it rather than being quietly short.
+
+### U27. Every column the desktop shows is read twice, and the second read is not the fixable one
+
+On connect, `src/hooks/use-connection-manager.ts` posts `/api/db/objects/inventory` with
+`includeColumns: true`, which reads columns for the whole database before any row is expanded.
+The desktop sidebar then posts `/api/db/objects/describe` once per object row the reader opens, for
+columns the first read already has.
+
+Repro: open a connection on a desktop viewport with the network panel open.
+One inventory request carries every column of every table with no gesture behind it.
+Expand one table: a `describe` request fetches that table's columns again.
+
+The design filed this as "the fix is moving the mobile schema tab onto the tree and dropping
+`includeColumns`", and that remedy is wrong as stated.
+Measured in `src/components/Studio.tsx`, the inventory's answer (`conn.schema`) has more readers than
+the schema tab: `SchemaDiagram`, `BottomPanel`, `DataImportModal`, `CommandPalette`, the
+`objectAtPath(conn.schema, ...)` lookups behind the profiler, the code generator and the test-data
+generator, and `conn.schemaContext`.
+The inventory route's own docblock names the same population.
+So moving the mobile tab onto the tree removes one reader of seven and drops nothing.
+
+**Done when:** each reader of `conn.schema` either has a source that is not a whole-database eager
+column read or is named here with the reason it needs one, and a connection whose readers all moved
+costs no column read until a row is opened.
+
+### U28. The single-object describe answer is unbounded, on the route and on the embedded seam
+
+`describeObjects` answers an `ObjectDetailBatch`, which carries `truncated` and takes a `limit`, so
+the vocabulary for a bounded answer exists.
+`describeObject` has neither: `POST /api/db/objects/describe` hands the provider's answer straight
+back, and `WorkspaceObjectReader.describeObject` in `src/workspace/types.ts` lets a host answer
+whatever it likes.
+The tree renders one row per column of whatever arrives.
+
+Repro: implement `describeObject` in an embedded host so it answers 50,000 columns for one table and
+open that row.
+Nothing between the host and the flattened row list refuses, truncates or says a word about the size.
+
+Not fixed in #789 because the bound is not this seam's to invent: `listObjects` has the same open
+question, `INVENTORY_PAIR_LIMIT` bounds the pair fan-out and not the per-object answer, and two
+different bounds decided in two PRs is how a reader ends up with a truncated list and an untruncated
+detail of the same object.
+
+**Done when:** the single-object answer carries the same bound and the same truncation signal as the
+batch one, on the route and on the seam, the bound is the same decision as `list`'s, and the tree
+says so on a row where it was hit.
+
+### U30. A search alias or stream over more than one index is described by the first index's mapping
+
+`src/lib/db/providers/sql/search/` declares `index`, `alias` and `stream` as kinds that have columns,
+and the mapping read in `http-transport.ts` takes `Object.values(payload)[0]`, the first entry of the
+`_mapping` response.
+An alias or a data stream that spans several backing indices is therefore described by one of them,
+and which one is whatever the cluster serialised first.
+
+Where the backing indices share a mapping the answer is correct, which is the common case and the
+reason this ships rather than being blocked.
+Where they do not, a field present only on a later index is missing from the tree's column rows and
+from the agent's column grounding, which has read the same transport answer since #789.
+So this is an existing provider answer that the tree makes visible; the tree did not create it.
+
+Repro: on Elasticsearch, create `logs-000001` and `logs-000002` with different mappings, point an
+alias at both, and expand the alias in the object tree.
+Only the first index's fields are drawn.
+
+**Done when:** `describeObject` for an alias or a stream answers the union of every `_mapping` entry
+in the response, a field two backing indices type differently is reported rather than resolved
+silently to one side, and both products have a fixture for the disagreeing case.
+
+### U31. No per-folder column prefetch, and the break-even that decides one is unmeasured per engine
+
+The tree reads one object's columns at a time, on the gesture that opens the row.
+`describeObjects` reads a whole folder in one round trip and is cheaper per object once enough rows
+in that folder are opened.
+Where that crossover sits differs by more than an order of magnitude across the fleet, from the A/B
+tables the provider docs already carry:
+
+| Engine | One `describeObjects` over a folder | Per object, single read |
+|---|---|---|
+| Trino | 165 ms / 200 objects | 25.8 ms |
+| Druid | 23 ms / 4 objects | 22.5 ms |
+| PostgreSQL | 33 ms / 200 objects | 20.7 ms |
+| Couchbase | 293 ms / 40 collections | 11.6 ms |
+| DuckDB | 26 ms / 200 objects | 6.5 ms |
+| Elasticsearch | 9 ms / 261 indices | 5.3 ms |
+| SQL Server | 161 ms / 200 objects | 2.2 ms |
+| MongoDB | 108 ms / 200 collections | 2.1 ms |
+| Redis | 2 ms / 4 groupings | 1.5 ms |
+
+Roughly six opened rows on Trino, two on PostgreSQL and seventy on SQL Server, which is why a
+constant trigger is not available.
+Each figure is one engine's own doc, on one version, against one fixture, so they are a starting
+point for a measurement rather than the measurement.
+
+The prefetch was left out because a folder read pays its whole cost on the gesture that is today the
+primary way to browse, for columns nobody asked to see: 293 ms on Couchbase and 165 ms on Trino for a
+reader who opens Tables and expands nothing.
+It also needs a second cache shape, since `ObjectDetailBatch` is bounded and the rows past the bound
+still need the single read.
+
+**Done when:** the numbers above have been re-measured on the versions in `docker-compose` at the
+time, the prefetch triggers on a per-engine threshold derived from those numbers rather than a
+constant, and a bounded batch and a single read land in one cache shape rather than two.
+
+### U32. A catalog change that lands during an in-flight read is dropped, and the pre-DDL answer stays
+
+`run` refuses a read whose key is already in flight
+(`src/components/object-tree/use-tree-nodes.ts:517`) and `refresh` issues its reads without waiting
+for anything (`:696`), so a `refreshToken` bump that arrives while a read is still open issues
+nothing for that slot.
+The answer that lands is the one asked for before the DDL statement ran, `store` writes it as the
+row's current state, and nothing re-issues until the next bump.
+A column added by that statement is therefore missing behind the twisty, and the row asserts a
+column list the engine no longer has, for as long as the reader runs no further DDL.
+
+Pre-existing, and measured as such rather than assumed. The guard and `refresh` both predate the
+column rows, and the same gesture on a folder's `list` read, with a capability set that declares no
+`hasColumns` so nothing in the column path is exercised, loses the same way: the bump issues
+`containers` and `counts` and no second `list`, and a table the statement created is absent until
+the next bump. So this is a standing property of `refresh` and not something the column rows created.
+The column rows do make it easier to reach, because a describe is slower than a listing and there is
+one per open object.
+
+Repro: PostgreSQL, standalone shell. Hold `POST /api/db/objects/describe` for `orders` open, expand
+`orders`, and while the describe is still open run `ALTER TABLE orders ADD COLUMN note text` in the
+editor. Release the held describe with the pre-DDL answer. The row draws the pre-DDL columns, no
+second describe is issued for it, and `note` appears only after the next DDL statement.
+
+A plain second `run` call is NOT the fix, and that is the trap this entry exists to record. Two
+describes for one row would then be in flight with no ordering between them, and the older can land
+last and overwrite the newer, which is a worse failure than a stale answer the next bump corrects.
+The fix records that a key was refused while in flight and re-issues it once the first settles, and
+it has to do that for all four slot kinds rather than for `details` alone: teaching one read kind to
+survive this race and leaving the other three behind is a harder inconsistency to reason about than
+the race itself.
+
+**Done when:** a bump that arrives while a read is in flight causes exactly one re-read of that slot
+after the first settles, for every slot kind, with never two reads of one slot in flight at once, and
+a test holds a read open across a bump and asserts the second answer is the one on screen.
+
+### U33. Three tree spans miss 4.5:1 on a selected row, and the docblock measured one background
+
+Three spans in `src/components/object-tree/TreeRow.tsx` are `text-muted-foreground` at 10px:
+`tree-row-column-type`, `tree-row-count` and `tree-row-badge`. Cited by test id rather than by line,
+because the line numbers in that file moved twice while this entry was being written. Measured
+against the repository's own compiled stylesheet, with the token values read off the live page rather
+than the file:
+
+| row background | light | dark |
+|---|---|---|
+| plain | 4.74 | 7.76 |
+| hover | 4.50 | 6.70 |
+| selected (`bg-muted`) | 4.35 | 5.81 |
+
+WCAG 1.4.3 asks 4.5:1 for text below 18.66px, so the light theme fails on the selected row and sits
+exactly on the line on hover. The failing background is not an edge case: clicking a row is the
+primary gesture on the tree, and a clicked row carries `aria-selected="true"` and `bg-muted`, so it
+is the reader's own row that fails.
+
+The correctness note above the type slot, the paragraph beginning "NO `/70`", reaches its conclusion
+from one background. It records `#737373` on `#ffffff` (4.7:1) and `#a1a1aa` on `#09090b` (7.7:1) and
+names neither the hover nor the selected ground, so the `/70` opacity it correctly refuses is refused
+for a reason narrower than the slot's real range, and the note reads as a clearance it has not
+established.
+
+The count and the badge have carried the same ratio since before the column rows existed, so the
+type slot joins a defect rather than introducing one. Repairing the three together, rather than
+recolouring one span in the change that added it, is why this is an entry.
+
+Repro: open the object tree, click any row so it carries `bg-muted`, and measure
+`tree-row-column-type`, `tree-row-count` or the badge text against the row's own background in the
+light theme.
+
+**Done when:** all three spans clear 4.5:1 on the plain, hover and selected backgrounds in both
+themes, the docblock states the measurement per background instead of one, and the ratios are
+asserted in `tests/unit/theme-accent-contrast.test.ts` through `tests/helpers/contrast.ts` rather
+than written down as prose.
+
+### U34. A refresh that drops the focused row sends focus to the document body
+
+`ObjectTree` keeps exactly one tabbable row,
+`rows.find((row) => row.id === activeId)?.id ?? rows[0]?.id`
+(`src/components/object-tree/ObjectTree.tsx:174`), and the focus effect below it moves focus only on
+an explicit `focusRequest`. When a catalog refresh removes the focused row from the model, the
+focused element unmounts, the browser hands focus to `document.body`, and the tab stop falls back to
+the first row. Arrow keys then do nothing, because the key handler is on the row, and the reader has
+to press Tab to re-enter the tree at the top, several screens from where they were.
+
+Pre-existing, and the tempting reading that `DROP COLUMN` makes it newly reachable is refuted by its
+own control: the same gesture against an OBJECT row, which `DROP TABLE` reaches and which predates
+any column work, loses focus identically, focus on `BODY` and the tab stop back on the first row.
+`git diff origin/main...HEAD -- src/components/object-tree/ObjectTree.tsx` reaches neither the
+fallback nor the focus effect. Column rows add one more way in, not the fault.
+
+Repro: PostgreSQL, standalone shell. Focus a column row of `orders` with the keyboard, then run
+`ALTER TABLE orders DROP COLUMN note` for that column in the editor. After the refresh,
+`document.activeElement` is `BODY`, the tab stop is the first row, and ArrowDown does nothing. Repeat
+with a table row and `DROP TABLE` to see the pre-existing half.
+
+**Done when:** a refresh that removes the focused row moves focus to the nearest surviving row, the
+parent for a dropped child and the next sibling otherwise, keyboard navigation continues from there
+with no Tab, and both the object-row case and the column-row case are tested.
+
+### U35. The type slot shows the wrapper and not the type on engines whose types nest
+
+The `aria-hidden` half of the `tree-row-column-type` span in `src/components/object-tree/TreeRow.tsx`
+renders `row.column.type.split("(")[0]`. That rule is right where the parenthesis opens a parameter
+list, which is why `VARCHAR(255)` reads `VARCHAR`, and wrong where it opens the type itself. Driven
+through the component with the spellings
+`docs/providers/clickhouse.md` records as what that provider returns:
+
+| the provider's answer | on screen |
+|---|---|
+| `Int32` | `INT32` |
+| `Nullable(String)` | `NULLABLE` |
+| `Array(UInt8)` | `ARRAY` |
+| `Map(String,String)` | `MAP` |
+| `Enum8('x'=1,'y'=2)` | `ENUM8` |
+| `LowCardinality(String)` | `LOWCARDINALITY` |
+| `Decimal(10,3)` | `DECIMAL` |
+
+So for every nullable or low-cardinality ClickHouse column the visible slot says only that the column
+is wrapped and never what it holds, and a reader scanning a table's types learns nothing from the
+column that needed the annotation most. Degraded rather than lost: the full spelling stays in the
+`title` and in the `sr-only` twin, so the tooltip and the accessible name are correct.
+
+Not the tree's invention. `src/components/schema-explorer/ColumnList.tsx:36` does the identical
+split, so the tree restores behaviour the flat explorer already had on the same engines, which is
+why this is an entry covering both readers rather than a line in the change that added the second.
+There is no second field to fall back to either: the ClickHouse provider publishes the wrapped
+spelling and no base type beside it.
+
+Repro: connect ClickHouse, create a table with a `Nullable(String)` column, and expand it in the
+object tree. The right-hand slot reads `NULLABLE`.
+
+**Done when:** a nested type shows the reader the inner type rather than the wrapper, the choice is
+driven off what the provider publishes rather than off the shape of the string and without branching
+on a database type id in a component, and the tree slot and the flat explorer's column list take the
+same answer from one place.
 
 ## Dependencies
 
@@ -960,6 +2509,37 @@ that the moderation lag is accepted permanently and this entry is deleted.
 
 ---
 
+---
+
+### REL4. Two tests scan gitignored files, so a local draft fails a gate CI cannot
+
+The citation scan globs `docs/**/*.md` and reads whatever is on disk. `.gitignore:133` excludes
+`docs/superpowers/`, where plans, specs and run reports are written during a working session, and
+those drafts cite backlog ids freely. So `bun run test` goes red on a maintainer's machine over
+files that are not in the repository, while CI, which checks out only tracked files, is green on the
+same commit.
+
+Measured while cutting 0.16.0: six citations across four untracked report files failed
+`every cited entry exists`, and the whole suite had to be re-run with `docs/superpowers/` moved
+aside to get a coverage number. The failure names the untracked path, so it is diagnosable, but it
+costs a full run to discover and it trains the reader to treat a red suite as noise, which is the
+real damage.
+
+`tests/unit/agent-documentation.test.ts` asks the same question of `docs/AGENT.md` alone and does
+not have the problem, because it names one file rather than a glob.
+
+`tests/unit/published-credentials.test.ts` is the same defect in a second test, measured while
+cutting 0.16.1. It walks the working tree for published passwords, and `deploy/rancher/results/` -
+gitignored at `.gitignore:162`, written by the Rancher E2E run skill - holds the per-scenario
+`secrets.txt` files that run generates. Six offenders in `assigns no admin or user password
+anywhere` and one in `hands no working password to a login example`, all from paths CI never checks
+out. Its floor assertion needs the same treatment as the citation scan's.
+
+**Done when:** both scans enumerate tracked files, for example by driving the glob through
+`git ls-files` and intersecting, so a working tree with local drafts under `docs/` or `deploy/`
+gives the same verdict as a clean checkout. Each scan's own floor assertion stays, so a broken
+enumeration still fails loudly rather than passing vacuously.
+
 ## Chart configuration surface
 
 Found while reviewing #362 (the Gateway API `HTTPRoute` template) and its follow-up #366. None is
@@ -1034,6 +2614,30 @@ considered each introduced a worse flaw.
 
 **Done when:** a cheaper, audit-visible eviction policy is found that does not reopen the oldest-first
 bypass.
+
+---
+
+### H12. A `jwtVerify` failure in the proxy leaves a log line and no audit event
+
+The proxy refuses a request on three grounds and audits two of them. `src/proxy.ts` emits
+`origin_mismatch` at `:65` and `insufficient_role` at `:156`, both through `emitAuditEvent`. The third
+is the trailing `catch` at `:173-176`: a token that fails `jwtVerify` because it is forged, tampered,
+expired or truncated falls into `logger.warn("JWT verification failed, redirecting to login")` and
+redirects. Nothing reaches the audit channel.
+
+An operator reading `GET /api/admin/audit` sees origin and role refusals and no forged-token attempts
+at all, which is the direction the blind spot matters: those are the probes a deployment most wants
+counted. The stdout line still exists and still lands in the aggregator, so the evidence is not lost,
+only off the surface an operator is pointed at.
+
+Recorded here rather than fixed with the note, because closing it is a behaviour change rather than a
+wording one: the catch has to distinguish a verification failure from a missing token, since
+`/login` redirects with no cookie are ordinary logged-out traffic and the note already excludes them.
+Whatever emits needs its own test in `tests/security/auth-audit.test.ts`, and the emit is metered
+through the anon bucket like every other `permission_denied` line.
+
+**Done when:** the verification-failure arm of that catch emits an audit event naming the route and
+the reason, distinct from a missing token, with the row 1.4 residual in `docs/SECURITY.md` deleted.
 
 ---
 
@@ -1272,6 +2876,99 @@ engine in the pipeline is the throwaway PostgreSQL container behind
 a multi-command escape are rejected through the profile under the resolved role. Cheapest path is
 extending the functional-smoke container, not adding a service to every CI test job.
 
+### A6. SQL Server's agent plan cannot be weighed, because the editor has no strategy to key it to
+
+The SQL Server agent profile asks the optimizer for an estimating plan as a session MODE - `SET
+SHOWPLAN_ALL ON`, which must be the only statement in its batch and must be turned off again on the
+same connection - and `ReadOnlyStatementMode`'s `"estimate-plan"` exists to carry exactly that.
+`src/lib/explain` cannot express it: every strategy there builds a single-statement PREFIX
+(`select-prefix.ts`), so `MSSQLProvider.getCapabilities` still answers `supportsExplain: false` (#126)
+and the editor's Explain button stays hidden on this engine.
+
+Two agent-side consequences follow from the same missing half, and both are the honest reading rather
+than a defect. `ExplainFormat` has no SQL Server member, so the plan the run holds travels with
+`format: undefined`; `summarisePlan` finds no `PLAN_READINGS` arm and answers `{ access: "unknown" }`;
+and `planRefusal` in `auto-execute.ts` falls through to `unverified-dialect`. So `inspect_plan`
+answers, the model reads the plan and recommends against it - measured, it recommended a nonclustered
+index off a Clustered Index Scan - and auto-execute never hands a result over on the plan's strength.
+DuckDB already ships in that state for the other reason: `duckdb-json` IS an `ExplainFormat` and has
+no reading either.
+
+**Done when:** a SQL Server EXPLAIN strategy exists that a session mode can be expressed through
+(#126's dialect wrapper), and `plan-summary.ts` gains a reading verified against a real
+`SET SHOWPLAN_ALL` result set, in the same change. Either half alone is worse than neither: a button
+with no reading gives the editor a plan the agent still cannot weigh, and a reading with no
+`ExplainFormat` member has nothing to key on.
+
+### A7. The agent's byte budget TOTAL is measured after the result exists, on every engine that has one
+
+SQL Server is the engine that makes this visible, because it is the first whose result budget is the
+SERVER's.
+`queryReadOnly` issues `SET ROWCOUNT <maxResultRows + 1>` before the statement, so the result arrives
+already bounded in rows, and `SET TEXTSIZE <maxResultBytes + 1>` beside it, so no single VALUE arrives
+whole either.
+In both the `+ 1` is what keeps a cut detectable rather than silent, and the value half is checked in
+the server's own unit by `assertNoValueWasCut`, because `SET TEXTSIZE` counts wire bytes while the
+budget counts UTF-8, which `docs/providers/mssql.md` §12.5 carries the measurement for.
+The other three do neither: PostgreSQL, SQLite and DuckDB compare `rows.length` and then
+`measureResultBytes(rows)` against the budget after the driver has materialised everything.
+
+What is left is the TOTAL, and it is post-hoc on all four.
+`resultBytes > budget.maxResultBytes` is measured on a result that already exists, and a row budget
+bounds row COUNT while a value ceiling bounds one VALUE, so rows times values can exceed
+`maxResultBytes` before the sum is taken: many rows of moderate `varbinary(max)` or `nvarchar(max)`
+values are materialised in the Node process before the cap can refuse them.
+On the other three engines that same check is also all there is for a SINGLE large value, so both
+halves are post-hoc there.
+
+Measured while building the SQL Server profile, and the reason the row half was worth doing at all:
+without `SET ROWCOUNT` one 20-million-row cross join took the Node process down with an
+out-of-memory crash before any result-side cap looked at it, and `requestTimeout` did not prevent it,
+because tedious stops the request timer on the first data packet.
+With `SET ROWCOUNT 1001` the same statement returned 1001 rows in 6 ms.
+
+Still not a SQL Server entry, and the per-value fix is the reason rather than a counter-example to it.
+That fix went in per provider because SQL Server is the only one of the four with a server-side lever
+for a value, and it closed the single-value half on one engine without touching the total on any.
+The total is a property of how a result is READ rather than of any one value, none of the four offers
+a lever for it, the ceiling is one number in one policy (`ExecutionBudget`), and the shape is
+identical in all four `queryReadOnly` implementations - so spelling what remains four different ways
+would be four truncations of one rule.
+
+**Done when:** the byte ceiling is enforced while the result is read rather than after it is held -
+a streaming read that stops at the ceiling - in every provider that implements `queryReadOnly`, so
+that the budget bounds memory rather than reporting on it.
+On SQL Server that is the total alone, since `SET TEXTSIZE` already bounds each value; on PostgreSQL,
+SQLite and DuckDB it is both.
+
+### A8. SQL Server's admitted SELECT reaches server-level metadata, which is A3 on a third engine
+
+A3 records that neither agent profile bounds what an admitted statement may READ with a
+database-native control. SQL Server joins it, and is the first where the surface left open is the
+SERVER rather than the database.
+
+The least-privilege principal this profile requires - `db_datareader` plus `VIEW DEFINITION`,
+`VIEW DATABASE STATE` and `SHOWPLAN`, which `docker/mssql-init/02-agent-principal.sql` creates -
+cannot reach another user database and cannot reach the file system. Measured on SQL Server 2022
+(16.0.4265.3): a read of a second user database answers "The server principal is not able to access
+the database under the current security context", and `OPENROWSET(BULK …)` is refused outright. What
+it can still read is what `public` can, and every principal is a member of `public`: from the
+connected database, a three-part name reached `master.sys.databases` (9 rows, every database on the
+instance, the same 9 `sa` sees), `master.sys.server_principals` (21 of the 33 rows `sa` sees) and
+`master.dbo.spt_values` (2574 rows). The admission step sees an ordinary one-statement `SELECT` in
+each case, because that is what it is, and the policy layer's declared-target allowlist reads SQL -
+defense in depth, which is A3's own distinction.
+
+Not closable by narrowing the grants in that fixture. `public`'s read of `master` is the instance's
+default rather than something this profile hands out, so the lever is a `DENY` on those views for the
+agent login, and that is an instance-level change belonging to an operator's deployment rather than
+to a provider.
+
+**Done when:** A3's answer covers SQL Server as well - out-of-scope reads refused by something that
+does not read SQL. The per-target grant set A3 proposes is the nearest fit here, generated for the
+agent principal and paired with the `DENY` above, and `docs/providers/mssql.md` is where an operator
+has to meet it.
+
 ---
 
 ## Agent M2 deferrals (#329)
@@ -1344,109 +3041,57 @@ the new signal — and when classification no longer depends on a substring a ta
 satisfy. Driver error codes (PostgreSQL `SQLSTATE`, SQLite `errcode`) are the signal that does not
 collide, and each provider already has access to its own.
 
-### B5. The agent run ledger assumes one writer per run, and cannot enforce it
+### B5. The agent run ledger cannot fence two writers, so single ownership has to be asserted above it
 
 `run-store.ts` and `run-service.ts` are append-only over the durable world's stream primitives, which
 offer no compare-and-append: a writer cannot say "append this only if the stream is still at index N".
-Every operation is read-then-append. Two consequences follow that a single-writer run never meets:
+Two consequences follow, and only the process-local half of the second is closed:
 
 - **Two concurrent opens on one caller-supplied run id write two headers.** The fold refuses a ledger
   with a second header (`MALFORMED_LEDGER`), permanently, for every later read. The race does not
-  resolve in one side's favour — it bricks the run. Nothing minted internally can collide (UUIDv4, 122
-  random bits), so reaching this needs a caller that supplies its own id, which is what the
-  workflow-run-id path does.
-- **Two loops driving one running run would both perform the same step.** `runStep` reads the ledger,
-  sees the step neither settled nor invoked, and appends its invocation. Two readers of the same state
-  both pass that check. The write-ahead ordering makes a step at-most-once *per loop*, not *per run*.
-  The milestone's "no tool execution performed twice" criterion is about a restart, where the dead
-  process is gone by construction, and that case is genuinely covered.
-
-Not defended at the storage layer because every cross-process defence available is worse than the
-constraint: a lock file is single-instance only (which the Postgres backend exists to escape), and a
-lease in the ledger is a distributed-lock design with its own expiry semantics. Single ownership of a
-running workflow belongs to the layer above.
-
-How strong the guarantee is depends on the backend. On the zero-config local world it holds by
-construction: the queue awaits each delivery before attempting the next, so retries are sequential. On
-the opt-in Postgres backend a visibility-timeout redelivery can overlap a handler that is still alive,
-which is where the second bullet would bite.
-
-**Severity is a function of B9.** Nothing delivers an agent drive today: `mintAgentDriveToken` has no
-production caller, there is no `"use workflow"` function and no queue producer, so a run is driven
-exactly once, in the process that opened it. A second drive is not reachable through the product on
-either backend. Producing one takes a caller that mints its own drive credential from `JWT_SECRET`,
-which is how the fence below was exercised against a live run rather than only in a test. Closing B9 is
-what makes this live — and in that order, because a producer without the fence is a redelivery that runs
-the user's statement a second time.
-
-The process-local half of the fence exists (2026-08). `claimDrive`/`releaseDrive` refuse a second
-concurrent drive of one run inside a single process, and `AgentRunStore.append` refuses an append once
-the run's stream has been closed (`RUN_ALREADY_CLOSED`), turning the silent-loss mode into a loud
-refusal. The cross-process half is open: two replicas would still both pass the read-then-append check.
+  resolve in one side's favour — it bricks the run. Run creation still has to be serialized by its
+  caller.
+- **Two loops driving one running run would both perform the same step.** The drive claim is now a
+  DURABLE ledger record — `drive-claimed`/`drive-released` — rather than a memory-only set, and
+  `tryClaimDrive` serializes check-then-append per store instance (#998, pinned by a fifty-claim
+  concurrency test). The cross-process half is open: two replicas would still both pass the
+  read-then-append check, because the durable world offers no tail-index conditional append (B16).
 
 **Done when:** the ledger can append conditionally on the stream's tail index, or the single-ownership
-guarantee the runtime provides is asserted by a test rather than assumed by prose. The process-local
-claim is asserted in `tests/unit/lib/agent/run-service.test.ts`, the append-after-close guard in
-`tests/unit/lib/agent/run-store.test.ts`.
+guarantee is asserted for every backend a deployment can reach. The process-local durable claim is
+asserted in `tests/unit/lib/agent/run-store.test.ts`.
 
-### B6. Every agent cost ceiling is per-drive, so N resumes cost up to N times one drive's budget
+### B6. The repair ledger is per-drive, so a resumed run's repair attempts start over
 
-The three things that bound what a run may spend — `ExecutionBudgetTracker` (`maxStatementsPerRun`,
-`maxTotalRunMs`), `AgentRepairLedger` and `AgentRunDeadline` — are all constructed by the process that
-drives a run and live only in its memory. `runInvestigation` takes them as injected resources, so a run
-resumed after a process death is handed a fresh set and starts each ceiling again.
+`ExecutionBudgetTracker` (`maxStatementsPerRun`, `maxTotalRunMs`), `AgentRunDeadline` and the artifact
+allowance were all constructed by the process that drives a run and lived only in its memory, so a run
+resumed after a process death was handed a fresh set. Those are now derived from the run's own ledger
+(#999): the deadline from `createdAtMs`, the statement and elapsed-time spend folded from
+`tool-completed` entries, and the artifact allowance from the workflow ceiling. A run that dies and
+resumes ten times no longer multiplies those tenfold.
 
-A run that dies and resumes ten times may perform ten times `maxStatementsPerRun` statements and spend
-ten times its workflow's `runDeadlineMs`, even though each drive stayed honestly inside its bounds.
+`AgentRepairLedger` is the remaining per-drive piece: `runtime.ts` rebuilds it fresh for every drive,
+so a resumed run starts its repair attempts over. Ten resumes can therefore still spend ten repair
+budgets, even though each drive stayed honestly inside its bounds.
 
-Nothing claims otherwise: `AGENT_WORKFLOW_BUDGETS`'s docblock states the per-drive scope explicitly. It
-matters for two later tasks — a budget meter must not present a per-drive figure as a run total, and any
-retry policy that resumes automatically would multiply the ceiling without a user asking.
+**Done when:** a drive's repair attempts are derived from the run's own history — or the per-drive
+rebuild is asserted by a test rather than assumed — with a test that resumes a run twice and shows the
+second drive inheriting the first's repair spend.
 
-The data needed is already persisted. `AgentRunRecord` carries `createdAtMs`, and the ledger holds
-every settled step, so a drive could fold the run's own history into the ceilings it starts with: a
-deadline measured from `createdAtMs`, a statement count folded from `tool-completed` entries.
+### B9. The resume sweep is local-only, and a resumed run is not driven back into the rail
 
-**Done when:** the ceilings a drive enforces are derived from the run's ledger rather than from the
-drive's own construction, with a test that resumes a run twice and shows the second drive inheriting
-the first's spend.
+The local sweep (#1000) now finds runs a dead process left `running` and drives each one again, with
+the drive's own claim as the single-flight and B6's cross-drive ceilings accounted for. What remains:
 
-### B9. Nothing enqueues an agent drive, so an interrupted run is resumable but never resumed
+- **The sweep is local-only.** It lists the `local` world's ledger streams; the multi-replica Postgres
+  world is absent from the shipped artifacts (B16), so no cross-replica sweep exists.
+- **A user-visible resume does not re-attach the rail.** `resumeRun` sets the run back to `running`, but
+  `driveAgentRun`'s only callers are the start route and the drive route — neither on the resume path —
+  so a run resumed from the rail is picked up by the sweep, eventually, rather than by the rail's own
+  stream.
 
-Opened by #329 T9. `POST /api/agent/drive` exists, authenticates a server-minted single-purpose
-credential and resumes the run it names, and `src/lib/agent/runtime.ts` re-derives everything that run
-needs from its own ledger. So a resume WORKS. What does not exist is anything that asks for one.
-
-A run is driven exactly once, in the process that opened it. If that process dies mid-run the run stays
-`running` in the ledger with nobody to pick it up: `mintAgentDriveToken` has no production caller, and
-the workflow runtime is used only as the ledger's durable substrate — no `"use workflow"` function, no
-queue producer, so the backend's own re-enqueue-on-start never sees an agent run.
-
-Distinct from a drive that *fails*, which is recorded: a throw anywhere in `driveAgentRun` ends the run
-as `failed` with a classified reason, so an unconfigured model no longer leaves a run at `queued`
-forever. This entry is the case where the process is GONE — nothing threw, nothing can record.
-
-**Adopting the SDK's Next.js integration was refused deliberately.** Its documented setup asks for
-`/.well-known/workflow/*` to be excluded from the proxy matcher, and warns that a proxy on that path
-detaches the request body, so the callback could not authenticate its way through the middleware
-either. Worse than the requested edit: **this matcher already excludes it**, because the dot rule
-(`.*\..*`) skips every path containing a dot and `.well-known` contains one (AU2 records the same
-consequence). That route would sit outside `src/proxy.ts` entirely, unauthenticated, the moment it
-existed — with no matcher edit to review. The pinned decision for this case says driving in-process
-without a loopback hop is strictly better, which is what the start route does. The drive path is one
-the matcher DOES route, guarded by a credential rather than a path rule, and `tests/api/proxy.test.ts`
-pins both halves.
-
-Two things have to land together whenever a producer arrives, and neither is safe alone:
-
-- **A sweep that finds runs left `running`** and drives each one, at boot or on a timer, with the same
-  credential the callback already verifies.
-- **Single-flight per run.** Today no two drives of one run can overlap, because there is only ever one.
-  A producer removes that accident, and the ledger is read-then-append with no fencing (B5), so two
-  drives would both read "not invoked" for the same step and both perform it.
-
-**Done when:** a run whose process died is picked up without a person asking, no step is performed
-twice while that happens, and B6's per-drive ceilings are accounted for across the resumes it causes.
+**Done when:** a resumed run is driven on every backend a deployment can reach, and the rail re-attaches
+to the resumed run's stream instead of waiting for the sweep.
 
 ### B11. The rail can stop a run but cannot pause or resume one
 
@@ -1616,34 +3261,6 @@ depends on it and no user is waiting on it.
 **Done when:** the event model has settled and somebody is running Studio beside a stack that wants
 agent runs in it. #332 holds the full scope.
 
-### B35. A resumed run can evict its own still-cited results: the artifact cap is per drive
-
-`AGENT_MAX_ARTIFACTS` (`src/lib/agent/runtime.ts`) is `45 × 4 = 180`: the largest per-workflow statement
-ceiling times the four concurrent runs one agent process is sized for. Its justification used to be that
-"a run cannot produce more artifacts than it is allowed statements", which is true of a DRIVE and not of
-a run — every ceiling is per drive (B6), while a resumed run keeps its `runId` and its artifacts are
-keyed by it. A run driven three times may hold up to three times its statement ceiling, and one
-long-lived run can pass 180 with no concurrency at all.
-
-`ExecutionArtifactStore.put` spends the cap run-fairly: a store at the cap evicts the oldest artifact of
-the run that is STORING, which stops a busy run making "Show result" fail on a quieter one. Applied to a
-run past the cap, the same rule means the run evicts its own earliest evidence — the results its first
-drive read, which its report may still cite.
-
-Nothing about the ledger is wrong afterwards: a claim and its citation are durable, and the artifact
-route already answers "the rows are not here" for the run-ended and TTL-expired cases (B15). This is a
-third way to reach that answer, and the only one that can happen while the run is still live and the
-rail is still offering the control.
-
-Not closed with an artifact-only bound, deliberately. A ceiling that holds ACROSS drives is exactly what
-B6 describes as missing, and the run record already carries what it needs, so a second answer invented
-for artifacts alone would have to be unpicked when B6 lands. Raising the number cannot close it either:
-a run resumed often enough passes any constant.
-
-**Done when:** a drive's artifact allowance is derived from the run's own history rather than from a
-per-drive constant — most likely as part of B6 — with a test that drives one run twice past the cap and
-shows the first drive's cited results still readable, or the surface stating that they are not.
-
 ### B59. Per-model instructions have nowhere to go, and the mechanism that held them is gone
 
 Wording is measured, not constant: this repository twice changed a shared sentence, won several
@@ -1683,25 +3300,6 @@ the entry cannot tell what the model is actually driven with.
 
 **Done when:** the gate tests the stopping text and the affected cells are re-measured, or the
 two switches become one setting whose name covers both stops.
-
----
-
-### B67. There is no run history across conversations
-
-A run now belongs to a conversation, the rail names the one it continues and offers to leave it,
-and the steps of THAT conversation are listed from the run's own header. What is left of B36's
-"larger shape" is everything outside it: a user cannot see the conversations they had yesterday,
-cannot return to one, and cannot open an earlier step's report.
-
-The reason it is a separate entry rather than more of the same work is a measurement. Listing the
-current conversation needs no new infrastructure — each run's header carries its own prefix, so the
-chain is self-describing and `GET /api/agent/runs/{runId}` already serves any step. Listing ALL of a
-user's runs has nothing behind it at all: `run-store.ts` has no enumeration, there is no list route,
-and the two questions that follow immediately — pagination and retention — have not been asked. It
-is a persistence surface, not a rail change.
-
-**Done when:** a user can see their earlier conversations and open one, with the store's
-enumeration, the route and the retention rule each decided rather than inherited.
 
 ### B70. A run writes no summary for the step after it
 
@@ -1802,3 +3400,115 @@ so), and none of them has been measured.
 
 **Done when:** a resume onto a repointed connection does one stated thing, and the run's own record
 says which.
+
+### B78. Generated Redis and LibreDB command text carries em dashes
+
+House style forbids em and en dashes in anything that lands in the repo or in front of a user.
+`src/lib/query-generators.ts` emits five of them into text a user reads in the editor, reproduced in
+the browser on a live Redis 8 during task 28b by pressing Generate Command on a key-prefix row:
+
+    # Redis commands for "bulk:*" — select a line and Run Selected.
+    # List keys under this prefix — ONE scan iteration, not the whole set.
+    # Create or update it — this overwrites an existing value
+
+plus `:229` for the hash variant and `:411` for the LibreDB header. Eleven more sit in that file's
+doc comments. Pre-existing rather than #789's, and named here because task 27 found it and it would
+otherwise disappear: it is not one edit but a small sweep, and
+`tests/unit/lib/query-generators.test.ts` pins the exact strings.
+
+**Done when:** no emitted line in that file carries an em or en dash, and its tests assert the new
+wording.
+
+### B80. The inventory's two bounds do not reach the container enumeration
+
+`POST /api/db/objects/inventory` bounds the listings it issues (`INVENTORY_PAIR_LIMIT`) and the
+objects it returns (`INVENTORY_LIMIT`), and its own docblock says so. Neither reaches the walk that
+produces the containers in the first place. `enumerateContainers`
+(`src/lib/db/container-walk.ts`) calls `listContainers()` once at the top level and then once per
+parent at every level below, with no cap: a two-level engine holding 5,000 catalogs issues 5,001
+round trips before the first pair exists, and only then meets a limit. The pair limit truncates the
+SCAN, never the walk.
+
+Not invented here, because `container-walk.ts` has a second reader: the agent's grounding inventory
+(`src/lib/agent/tools.ts`) performs the same walk from its run context. A cap belongs to both or to
+neither, and it needs the `truncated` shape the route already publishes, so it is one decision
+rather than a number chosen at one call site. The route's docblock states the gap where it bites.
+
+**Done when:** the walk reports a bound the same way a saturated scan does, both readers carry it,
+and a test drives an engine whose top level exceeds the cap.
+
+### B79. A connection switch reads the new connection with the old engine's container depth
+
+Reproducible in a browser in one click. Select a depth-0 connection (SQLite), then a depth-2 one
+(DuckDB): the first request the tree issues is `POST /api/db/objects/counts` with
+`{"connectionId":"seed:t28b-duckdb","container":[]}`, which answers HTTP 400 "A DuckDB container
+path is [database] or [database, schema], received []". The tree then re-reads correctly and the
+final paint is right, so nothing is visible to the user; the 400 is in the server log on every such
+switch.
+
+The cause is a one-commit prop skew rather than anything in the tree: `Sidebar` renders `ObjectTree`
+with `activeConnection` and `metadata`, `useProviderMetadata` clears its metadata in an EFFECT, and a
+child's effects run before its parent's - so the tree's reconciler fires once with the new connection
+and the previous engine's `capabilities`. `Sidebar`'s own comment reasons about metadata being
+ABSENT ("Nothing is drawn while the declaration is missing") and not about it being STALE.
+
+Pre-existing in shape and newly consequential: while the sidebar only listed tables, a stale
+capability object cost nothing, and now the request SHAPE is derived from it.
+
+**Done when:** no read is issued for a connection whose declaration has not arrived, proven by a test
+that switches between two engines of different depth and asserts what was posted.
+
+### B81. A failure nobody attributed leaves the browser asserting that the server serves no seeds
+
+B37 landed and left this file; its id survives in the comments on `src/hooks/use-connection-payload.ts`
+and `src/hooks/use-connection-manager.ts`, which is where the reasoning below can be read against the
+code. It gave `ServedSeeds` a way to say "I do not have the seed list", and then gave the state an
+initial value of `{loaded: true, seeds: []}` under the name `NO_SERVED_SEEDS`, commented as
+"loaded, and genuinely empty". Before the first answer arrives nothing has been measured, so that
+value is a claim the browser is not entitled to, and it is the claim B37 was filed about.
+
+Measured on 2026-09-15 by driving the whole path with a gateway error page, the shape
+`tests/hooks/use-connection-manager.test.ts` already pins as intended:
+`GET /api/connections/managed` answers 502 with `text/html`, no `reason` is read from the body, so
+`setServedSeeds` is never called and the state is still the module constant by identity.
+`initializeConnections` then falls back to `storage.getConnections()`, the user's editable seed copy
+renders, and `resolveAgentRunConnectionId` answers `{id: null, reason: "browser-only"}`. The rail
+says, of a connection this application seeds itself:
+
+> Sample (Employees) cannot be rebuilt on the server: its settings live in this browser.
+
+That is B37's sentence, false in both halves, reached through a proxy instead of a malformed
+`seed-connections.yaml`. The hook's own comment says such a failure "says nothing" about the seed
+configuration; leaving the state at `{loaded: true, seeds: []}` is not saying nothing, it is saying
+the list is empty.
+
+The 404 arm is right by accident rather than by design: where the route does not exist at all, as in
+the platform embed, there is no seed service and no seeds, so "loaded, empty" is the true answer.
+Only a third state can hold both that and "asked, and the answer told me nothing".
+
+Two tests on the same subject cannot see this, and one of them is the reason it reads as deliberate.
+`tests/hooks/use-connection-manager.test.ts` waits on `connections` reaching `[]` and then asserts
+`servedSeeds` equals `{loaded: true, seeds: []}`, for the 404 arm and for the 502 arm. Both are the
+initial values, and with an empty `localStorage` neither moves on either path, so both tests pass
+against a hook that never issues the request. They pin the initial state under the name of a
+measured one. There is no honest barrier to wait on there while the settled value and the unasked
+value are the same object shape, which is the same defect one level up.
+
+**Done when:** an unasked seed list is distinguishable from a measured empty one, a non-OK the
+server did not attribute leaves the browser in the unasked state rather than the empty one, and the
+two tests above wait on a fact that a hook which never fetched cannot satisfy.
+
+### B82. The resume sweep keeps re-driving a run that dies again at the same point
+
+The sweep that #1000 added finds a run a dead process left `running` and drives it again, once per
+interval. A run whose process dies WITHOUT recording a failure — a hard crash, `kill -9`, a host
+reboot — stays `running`, so after its claim expires the sweep picks it up again. If it dies again at
+the same point, the sweep repeats this at every interval, forever.
+
+`driveAgentRun` turns a THROW into a terminal `failed` run, so an ordinary failure does not loop; this
+entry is only the case where the process is gone before it can write anything. There is no attempt
+counter, no max-retry and no dead-letter, because the sweep cannot tell "crashed again" from "never
+attempted": neither writes a record.
+
+**Done when:** the sweep stops re-driving a run after a bounded number of consecutive unrecorded
+deaths and says so — in the run's ledger or in the operator log.

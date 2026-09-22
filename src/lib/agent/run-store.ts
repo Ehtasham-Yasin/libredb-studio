@@ -57,7 +57,18 @@
  */
 
 import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { logger } from "@/lib/logger";
 import { getAgentRuntimeConfig } from "./config";
+import {
+  type AgentHistoryCursor,
+  type AgentHistoryEntry,
+  type AgentHistoryPage,
+  foldHistoryEntries,
+  historyStreamName,
+  paginateHistory,
+  parseHistoryEntry,
+} from "./history";
 import { assertPersistableState } from "./state-guard";
 import {
   type AgentThreadHeader,
@@ -76,7 +87,7 @@ import {
 } from "./types";
 
 /** Stream-name prefix, so one world may carry ledgers next to other streams. */
-const AGENT_LEDGER_STREAM_PREFIX = "agent-ledger-";
+export const AGENT_LEDGER_STREAM_PREFIX = "agent-ledger-";
 
 /**
  * Ids are `[A-Za-z0-9_]` and bounded: no `-` (see the module docblock), no `.` (the
@@ -189,10 +200,21 @@ export type AgentLedgerEntry =
       readonly objective: string;
     }
   | { readonly kind: "event"; readonly event: AgentRunEvent }
-  | { readonly kind: "cancellation-requested"; readonly atMs: number; readonly bySessionId: string };
+  | { readonly kind: "cancellation-requested"; readonly atMs: number; readonly bySessionId: string }
+  | { readonly kind: "drive-claimed"; readonly atMs: number; readonly driveId: string; readonly expiresAtMs: number }
+  | { readonly kind: "drive-released"; readonly atMs: number; readonly driveId: string };
 
 /** The two events that settle a step: the run asked, and something answered. */
 export type AgentSettledStepEvent = Extract<AgentRunEvent, { kind: "tool-completed" | "tool-refused" }>;
+
+/**
+ * One drive's claim on a run, as the ledger records it. A control record rather
+ * than a run event: it decides who may drive, never what happened.
+ */
+export interface AgentDriveClaim {
+  readonly driveId: string;
+  readonly expiresAtMs: number;
+}
 
 /**
  * Everything a run's ledger says, folded once. `record` is the product contract;
@@ -204,6 +226,12 @@ export interface AgentRunLedgerView {
   readonly terminal: boolean;
   /** When a stop was asked for, or `null`. Not a run event; see `AgentLedgerEntry`. */
   readonly cancellationRequestedAtMs: number | null;
+  /**
+   * The run's current drive claim, or `null` when none is held or the one that was
+   * held has been released. Expiry is judged by the caller against its clock, never
+   * by this fold, so the fold stays pure.
+   */
+  readonly driveClaim: AgentDriveClaim | null;
   /** Step id → the event that settled it. A settled step is never re-performed. */
   readonly settledSteps: ReadonlyMap<string, AgentSettledStepEvent>;
   /**
@@ -216,16 +244,18 @@ export interface AgentRunLedgerView {
 
 export type AgentRunStoreReason =
   | "INVALID_RUN_ID"
+  | "RUN_NOT_FOUND"
   | "RUN_ALREADY_OPEN"
   | "RUN_ALREADY_CLOSED"
   | "MALFORMED_LEDGER"
+  | "LEDGER_WRITE_FAILED"
   | "RUNTIME_DISABLED";
 
 export class AgentRunStoreError extends Error {
   readonly reasonCode: AgentRunStoreReason;
 
-  constructor(reasonCode: AgentRunStoreReason, message: string) {
-    super(message);
+  constructor(reasonCode: AgentRunStoreReason, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "AgentRunStoreError";
     this.reasonCode = reasonCode;
     Object.setPrototypeOf(this, AgentRunStoreError.prototype);
@@ -330,6 +360,8 @@ function parseEntry(runId: string, line: string): AgentLedgerEntry {
     return parsed as unknown as AgentLedgerEntry;
   }
   if (parsed.kind === "cancellation-requested") return parsed as unknown as AgentLedgerEntry;
+  if (parsed.kind === "drive-claimed") return parsed as unknown as AgentLedgerEntry;
+  if (parsed.kind === "drive-released") return parsed as unknown as AgentLedgerEntry;
   if (parsed.kind === "event" && isRecord(parsed.event) && EVENT_KINDS.has(String(parsed.event.kind))) {
     return parsed as unknown as AgentLedgerEntry;
   }
@@ -355,10 +387,22 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
   const invokedStepIds: string[] = [];
   let status: AgentRunStatus = "queued";
   let cancellationRequestedAtMs: number | null = null;
+  let driveClaim: AgentDriveClaim | null = null;
 
   for (const entry of rest) {
     if (entry.kind === "cancellation-requested") {
       cancellationRequestedAtMs ??= entry.atMs;
+      continue;
+    }
+    // The drive claim is a control record, not a run event: it changes who may
+    // drive, never what happened. Released only by the drive that took it, so a
+    // stray `drive-released` from another drive cannot clear a live claim.
+    if (entry.kind === "drive-claimed") {
+      driveClaim = { driveId: entry.driveId, expiresAtMs: entry.expiresAtMs };
+      continue;
+    }
+    if (entry.kind === "drive-released") {
+      if (driveClaim?.driveId === entry.driveId) driveClaim = null;
       continue;
     }
     // A run is opened once. A second header means two writers believed they owned
@@ -405,6 +449,7 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
     },
     terminal: status !== "queued" && status !== "running",
     cancellationRequestedAtMs,
+    driveClaim,
     settledSteps,
     unsettledStepIds: invokedStepIds.filter((stepId) => !settledSteps.has(stepId)),
   };
@@ -420,12 +465,89 @@ function foldLedger(runId: string, entries: readonly AgentLedgerEntry[]): AgentR
 const closedStreams = new Set<string>();
 
 /**
+ * How many chunks one whole-stream read asks for per page.
+ *
+ * The world's default page is 100, and `world-local` re-lists the chunk
+ * directory and re-skips every earlier file on EACH call — so a default-page
+ * read of N chunks is quadratic in the number of pages, not in the bytes. One
+ * large page keeps a 10 000-entry history index to a handful of round trips
+ * instead of a hundred re-walks.
+ */
+const STREAM_CHUNK_PAGE_SIZE = 1000;
+
+/**
+ * world-local 4.2.4 does not retry write()'s fs.access existence probe (#900).
+ * Its stream registration happens first, and this probe runs BEFORE publishing
+ * the chunk, so retrying this specific failure cannot duplicate a ledger entry.
+ * Never retry a write/rename failure: the chunk might already have committed.
+ * Match the current stream's chunk path as well as the syscall; a permission
+ * failure elsewhere in the backend does not establish that the append is safe.
+ */
+function isWindowsChunkProbeError(error: unknown, name: string): error is NodeJS.ErrnoException & { path: string } {
+  if (process.platform !== "win32" || !(error instanceof Error)) return false;
+  const fault: NodeJS.ErrnoException = error;
+  if (
+    !["EPERM", "EBUSY", "EACCES"].includes(fault.code ?? "") ||
+    fault.syscall !== "access" ||
+    typeof fault.path !== "string"
+  ) {
+    return false;
+  }
+  const file = fault.path;
+  const directory = path.win32.dirname(file);
+  return (
+    path.win32.basename(directory) === "chunks" &&
+    path.win32.basename(path.win32.dirname(directory)) === "streams" &&
+    path.win32.basename(file).startsWith(`${name}-chnk_`) &&
+    file.endsWith(".bin")
+  );
+}
+
+async function withWindowsChunkProbeRetry(name: string, write: () => Promise<void>): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop -- each attempt must settle before deciding whether to retry.
+      await write();
+      return;
+    } catch (error) {
+      if (!isWindowsChunkProbeError(error, name)) throw error;
+      if (attempt === 5) {
+        throw new AgentRunStoreError(
+          "LEDGER_WRITE_FAILED",
+          `agent stream "${name}" could not be saved: ${error.code} checking "${error.path}" after 6 attempts; the Windows file lock or permission denial persisted`,
+          { cause: error },
+        );
+      }
+      logger.warn(`agent stream "${name}": retrying ${error.code} existence probe for "${error.path}"`, {
+        attempt: attempt + 1,
+      });
+      // Match the upstream helper's five bounded retries and exponential backoff.
+      const delayMs = 10 * 2 ** attempt + Math.random() * 10;
+      // oxlint-disable-next-line no-await-in-loop -- backoff must finish before the next attempt.
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
+/**
+ * The outcome of asking the ledger for the right to drive a run. The refusal
+ * reasons are the store's, not the service's: the service maps them onto
+ * `AgentRunServiceError` for callers that speak the service vocabulary.
+ */
+export type AgentDriveClaimResult =
+  | { readonly claimed: true; readonly driveId: string }
+  | { readonly claimed: false; readonly reason: "RUN_ALREADY_TERMINAL" | "RUN_ALREADY_DRIVEN" };
+
+/**
  * The run ledger. One instance per process is enough: it holds no run state of
  * its own, only the world it writes through.
  */
 export class AgentRunStore {
   private readonly world: AgentLedgerWorld;
   private readonly clock: () => number;
+  private readonly streamWrites = new Map<string, Promise<void>>();
+  /** Serializes claim checks against their appends, per store instance. */
+  private claimQueue: Promise<unknown> = Promise.resolve();
 
   constructor(options: { readonly world: AgentLedgerWorld; readonly clock?: () => number }) {
     this.world = options.world;
@@ -498,6 +620,58 @@ export class AgentRunStore {
     });
   }
 
+  /**
+   * Claims the right to drive a run, durably. The check-then-append is serialized
+   * per store instance, so two drives in ONE process cannot both read "no claim"
+   * and both append one.
+   *
+   * **Scope:** the local `AgentLedgerWorld` provides single-process claim
+   * serialization. Cross-process/distributed claim atomicity is outside this PR
+   * and depends on the future Postgres world implementation (B16); the local
+   * world is single-process by construction, and `docs/BACKLOG.md` B5 records
+   * the Postgres case.
+   *
+   * An expired claim is no claim. The expiry must outlive the run's own deadline,
+   * so a still-live drive is never mistaken for a stale one.
+   */
+  async tryClaimDrive(runId: string, driveId: string, expiresAtMs: number): Promise<AgentDriveClaimResult> {
+    const id = assertRunId(runId);
+    return this.withClaimLock(async () => {
+      const view = await this.read(id);
+      if (view === null) {
+        throw new AgentRunStoreError("RUN_NOT_FOUND", `agent run "${id}" does not exist`);
+      }
+      if (view.terminal) return { claimed: false, reason: "RUN_ALREADY_TERMINAL" };
+      if (view.driveClaim !== null && view.driveClaim.expiresAtMs > this.clock()) {
+        return { claimed: false, reason: "RUN_ALREADY_DRIVEN" };
+      }
+      await this.append(id, { kind: "drive-claimed", atMs: this.clock(), driveId, expiresAtMs });
+      return { claimed: true, driveId };
+    });
+  }
+
+  /**
+   * Records that the named drive has released its claim. Safe to repeat: the fold
+   * clears a claim only when the released drive id matches the one it holds, so a
+   * release that arrives after the claim was already cleared is ignored.
+   */
+  async releaseDrive(runId: string, driveId: string): Promise<void> {
+    const id = assertRunId(runId);
+    await this.withClaimLock(async () => {
+      await this.append(id, { kind: "drive-released", atMs: this.clock(), driveId });
+    });
+  }
+
+  private withClaimLock<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.claimQueue.then(operation, operation);
+    // A failed claim must not poison the queue for the next claimant.
+    this.claimQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   /** The whole run, folded. `null` when no such run was ever opened. */
   async read(runId: string): Promise<AgentRunLedgerView | null> {
     const id = assertRunId(runId);
@@ -552,7 +726,40 @@ export class AgentRunStore {
   async close(runId: string): Promise<void> {
     const id = assertRunId(runId);
     closedStreams.add(id);
-    await this.world.closeStream(ledgerStreamName(id), id);
+    const name = ledgerStreamName(id);
+    await this.writeStream(name, () => this.world.closeStream(name, id));
+  }
+
+  /**
+   * Appends one finished run to the actor's history index (#830).
+   *
+   * Written by `run-service.ts`'s `finalize` — the single path every terminal
+   * run goes through — and never from `openRun`: a run that is still queued or
+   * running is the rail's live timeline, not history. The entry is inert and
+   * self-contained, so the listing below never opens the run's own ledger.
+   */
+  async recordHistoryFinish(entry: Omit<AgentHistoryEntry, "kind">): Promise<void> {
+    assertPersistableState(entry, "agent.history");
+    const line = `${JSON.stringify({ kind: "history-finished", ...entry })}\n`;
+    const name = historyStreamName(entry.sessionId);
+    await this.writeStream(name, () => this.world.writeToStream(name, entry.runId, line));
+  }
+
+  /**
+   * The finished conversations this actor can reopen, newest first.
+   *
+   * One stream read, folded in `history.ts`; the retention cap and the page
+   * boundary both live there, so the store is only the I/O seam.
+   */
+  async listConversations(
+    sessionId: string,
+    options?: { readonly limit?: number; readonly cursor?: AgentHistoryCursor },
+  ): Promise<AgentHistoryPage> {
+    const lines = await this.readStreamLines(historyStreamName(sessionId));
+    const entries = lines
+      .map((line) => parseHistoryEntry(line))
+      .filter((entry): entry is AgentHistoryEntry => entry !== null);
+    return paginateHistory(foldHistoryEntries(entries), options ?? {});
   }
 
   private async append(runId: string, entry: AgentLedgerEntry): Promise<void> {
@@ -566,28 +773,56 @@ export class AgentRunStore {
     // One newline-terminated entry per write. Framing is on newlines rather than
     // on chunk boundaries because a backend is free to coalesce or split chunks;
     // JSON escapes any newline inside the payload, so the framing is unambiguous.
-    await this.world.writeToStream(ledgerStreamName(runId), runId, `${JSON.stringify(entry)}\n`);
+    const name = ledgerStreamName(runId);
+    const line = `${JSON.stringify(entry)}\n`;
+    await this.writeStream(name, () => this.world.writeToStream(name, runId, line));
+  }
+
+  private async writeStream(name: string, write: () => Promise<void>): Promise<void> {
+    if (process.platform !== "win32") return write();
+    // A retry creates a new chunk ULID. Keep later writes (including EOF) behind
+    // it, so backoff cannot reorder a ledger. Different streams stay independent.
+    const previous = this.streamWrites.get(name) ?? Promise.resolve();
+    const operation = () => withWindowsChunkProbeRetry(name, write);
+    // Each caller receives its own failure; a failed entry must not poison the
+    // queue for later operations after its caller has handled that failure.
+    const pending = previous.then(operation, operation);
+    this.streamWrites.set(name, pending);
+    try {
+      await pending;
+    } finally {
+      if (this.streamWrites.get(name) === pending) this.streamWrites.delete(name);
+    }
   }
 
   private async readEntries(runId: string): Promise<readonly AgentLedgerEntry[]> {
-    const name = ledgerStreamName(runId);
+    const lines = await this.readStreamLines(ledgerStreamName(runId));
+    return lines.map((line) => parseEntry(runId, line));
+  }
+
+  /**
+   * Reads a stream back as whole lines, in chunk order.
+   *
+   * Decoded once over the concatenation: a multi-byte character may straddle a
+   * chunk boundary, so per-chunk decoding would corrupt an objective written in
+   * any non-ASCII script.
+   */
+  private async readStreamLines(name: string): Promise<readonly string[]> {
     const chunks: Uint8Array[] = [];
     let cursor: string | undefined;
     do {
-      const page = await this.world.getStreamChunks(name, runId, cursor === undefined ? {} : { cursor });
+      const page = await this.world.getStreamChunks(
+        name,
+        "",
+        cursor === undefined ? { limit: STREAM_CHUNK_PAGE_SIZE } : { limit: STREAM_CHUNK_PAGE_SIZE, cursor },
+      );
       for (const chunk of page.data) chunks.push(chunk.data);
       cursor = page.hasMore && page.cursor !== null ? page.cursor : undefined;
     } while (cursor !== undefined);
 
-    // Decoded once over the concatenation: a multi-byte character may straddle a
-    // chunk boundary, so per-chunk decoding would corrupt an objective written in
-    // any non-ASCII script.
     const decoder = new TextDecoder();
     const text = chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join("") + decoder.decode();
-    return text
-      .split("\n")
-      .filter((line) => line.length > 0)
-      .map((line) => parseEntry(runId, line));
+    return text.split("\n").filter((line) => line.length > 0);
   }
 }
 

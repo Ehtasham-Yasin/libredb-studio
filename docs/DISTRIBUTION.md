@@ -26,7 +26,9 @@ starting with the first release that includes the release-artifacts workflow —
 have Docker images only.
 
 > **Runtime note:** every channel here runs the production server under Node (`node server.js`),
-> including the Docker image — its runner stage is `node:26.8.1-trixie-slim` and `CMD` execs
+> including the Docker image — the default tag's runner stage is `node:26.9.0-trixie-slim`, the
+> `-alpine` tag's is `node:26.9.0-alpine3.23` and the `-alpine-slim` tag's is Alpine's own `nodejs`
+> package (see [Image tag model](#image-tag-model)), and in all three `CMD` execs
 > `node server.js`; Bun is only used to install dependencies during the Docker build and for local
 > development (`bun dev`). The SQLite DB provider adapts to whichever runtime it finds
 > (`bun:sqlite` under Bun, `node:sqlite` under Node) — see
@@ -62,8 +64,10 @@ server log:
   server does when a channel leaves those variables unset.
 
 **Strict mode:** set `AUTH_BOOTSTRAP=off` to disable generation and require explicit
-`JWT_SECRET` and `ADMIN_PASSWORD` (recommended for production; missing values then surface as a
-clear error on the login page instead of silently generated credentials in collected logs). Every
+`JWT_SECRET` and `ADMIN_PASSWORD` (recommended for production; a missing `ADMIN_PASSWORD` then
+surfaces as a clear error on the login page instead of silently generated credentials in
+collected logs, and a missing `JWT_SECRET` stops the server at boot with an actionable banner
+rather than starting a deployment whose every login is 503). Every
 channel that starts the server itself, the Helm chart included, defaults to zero-config and takes
 strict mode as an opt-in; the [Sealos](#sealos-app-store) template is the one channel that ships
 with it already on. Unrecognized `AUTH_BOOTSTRAP` values log a warning and keep bootstrap on.
@@ -76,14 +80,18 @@ sharing a user's machine, and it has not changed. (The Docker image and the Helm
 exception - a container binds all of its own addresses and is isolated by container networking
 instead. Since chart 0.1.42 and the image that ships with it, that set is not hardcoded: the container's
 entrypoint resolves a bind address at startup and prefers `::`, all addresses of both families.)
-`HOSTNAME` is the bind address wherever the server is started directly - Docker, Helm, npx, the
-systemd units and Snap; the `.deb`/`.rpm` and Homebrew wrappers and the Windows launcher take
-`LIBREDB_BIND` instead and discard an inherited `HOSTNAME`. The note below the table covers the
-address family either one selects.
+`HOSTNAME` is the bind address wherever the server is started directly and the value was chosen -
+Docker, Helm and the systemd units, the Snap daemon included; the `.deb`/`.rpm` and Homebrew
+wrappers, a direct `snap run` and the Windows launcher take `LIBREDB_BIND` instead and discard an
+inherited `HOSTNAME`. The npx launcher reads both: `--host`, then `LIBREDB_BIND`, then `HOSTNAME`
+only when it differs
+from the machine's own hostname, so a value a shell or a container runtime exported is ignored
+rather than bound (#813). The note below the table
+covers the address family either one selects.
 
 | Channel | Default bind | How to expose |
 |---|---|---|
-| npx | `127.0.0.1` | `npx @libredb/studio --host 0.0.0.0` (or set `HOSTNAME`) |
+| npx | `127.0.0.1` | `npx @libredb/studio --host 0.0.0.0`, or `LIBREDB_BIND=0.0.0.0`, or a `HOSTNAME` that differs from the machine's own name |
 | .deb / .rpm (systemd) | `127.0.0.1` | `HOSTNAME=0.0.0.0` in `/etc/libredb-studio/env`, then restart |
 | .deb / .rpm (direct run) | `127.0.0.1` | `LIBREDB_BIND=0.0.0.0 libredb-studio` |
 | Homebrew service | `127.0.0.1` | run the binary manually with `LIBREDB_BIND=0.0.0.0`, or front it with a reverse proxy |
@@ -93,19 +101,28 @@ address family either one selects.
 For anything reachable from a network, prefer a reverse proxy with TLS in front and strict mode
 (`AUTH_BOOTSTRAP=off`) with explicit credentials.
 
-A direct run of the `.deb`/`.rpm` wrapper or the Homebrew binary ignores any inherited `HOSTNAME`
-(empty, or - under Docker - the container ID Next.js would otherwise bind to) and defaults to
-loopback; `LIBREDB_BIND` is the explicit opt-in for that case. Under systemd, `HOSTNAME` in
-`/etc/libredb-studio/env` is still the override, since the unit resolves it before the wrapper
-runs (detected via the systemd-set `INVOCATION_ID`, so the wrapper leaves it untouched there). The
+A direct run of the `.deb`/`.rpm` wrapper, the Homebrew binary or the snap launcher ignores any
+inherited `HOSTNAME` (empty, or - under Docker - the container ID Next.js would otherwise bind to)
+and defaults to loopback; `LIBREDB_BIND` is the explicit opt-in for that case. Under systemd,
+`HOSTNAME` in `/etc/libredb-studio/env` or the snap unit's drop-in is still the override, since the
+unit resolves it before the wrapper runs (detected via the systemd-set `INVOCATION_ID`, so the
+wrapper leaves it untouched there). The
 Windows launcher rebuilds `HOSTNAME` from `LIBREDB_BIND` on every run, with no systemd exception.
+
+The npx launcher ignores an inherited `HOSTNAME` by the same rule and for the same reason: a value
+equal to the machine's own hostname is exactly what Docker's container id and a kubelet's pod name
+look like from inside, so it is not read as a choice (#813). Its overrides are `--host` first, then
+`LIBREDB_BIND` - which is also the way out of the one case the rule costs: a container started with
+`--hostname` naming itself, where that name and an injected one are indistinguishable.
 
 **Address family (IPv4, IPv6, dual-stack).** The bind address accepts an IPv6 literal in every
 channel, because whichever variable that channel reads ends up as the host argument of a plain
 `server.listen(port, hostname)` in the standalone Next.js server
 (`next/dist/server/lib/start-server.js`) - so it is Node, not Next, that gives `::` its meaning.
 (Next touches `[::]` only to format the URL it prints at startup.) Use `HOSTNAME` where the server is started directly
-(Docker, Helm, npx, the systemd units, Snap) and `LIBREDB_BIND` in the wrapper channels (a direct
+(Docker, Helm, the systemd units, Snap), `--host` or `LIBREDB_BIND` on the npx launcher, and
+`LIBREDB_BIND` in the
+wrapper channels (a direct
 `.deb`/`.rpm` run, Homebrew, the Windows launcher), per the paragraph above. The values that
 matter:
 
@@ -259,11 +276,17 @@ Production (strict mode, explicit secrets):
 ```bash
 docker run --name libredb-studio -p 3000:3000 \
   -e AUTH_BOOTSTRAP=off \
-  -e JWT_SECRET=change-me-to-a-random-32-char-string \
+  -e JWT_SECRET="$(openssl rand -base64 32)" \
   -e ADMIN_EMAIL=admin@libredb.org \
-  -e ADMIN_PASSWORD=your_secure_admin_password \
   ghcr.io/libredb/libredb-studio:latest
 ```
+
+Your shell expands `$(openssl rand -base64 32)` before `docker run` sees it, so the secret is a
+real 44-character one and no secret is written down here - it is the same fix line the startup
+banner prints when `JWT_SECRET` is too short, and a placeholder that cleared the 32-character
+minimum would be a published working secret. It is a NEW secret on each run, though: recreate the
+container and every existing session is invalidated, so pass a value you keep (from your own
+secret store) for a container that is meant to be replaceable.
 
 All environment variables are documented in [`.env.example`](../.env.example); a ready-to-use
 compose file is [`docker-compose.example.yml`](../docker-compose.example.yml). The container
@@ -285,6 +308,35 @@ Published by [`.github/workflows/docker-build-push.yml`](../.github/workflows/do
 
 Use `<version>` or `sha-<commit>` for reproducible deployments; `main` / `dev` are for testing
 unreleased code.
+
+**Variants.** Every tag above is published three times, once per base image (#840). The suffix is
+appended to whatever the tag would otherwise be, so `0.16.2`, `0.16.2-alpine` and
+`0.16.2-alpine-slim` are the same release on three bases, and `latest-alpine` and `dev-alpine` exist
+for the same reason `latest` and `dev` do.
+
+| Suffix | Dockerfile | Base | Engines | Use |
+|---|---|---|---|---|
+| none | `Dockerfile` | `node:26.9.0-trixie-slim` (glibc) | all, and the only one where Oracle **Thick** mode can be layered on | the default; unchanged, and what every example in this repository pulls |
+| `-alpine` | `Dockerfile.alpine` | `node:26.9.0-alpine3.23` (musl) | all, Oracle **Thin** only | a much smaller OS attack surface: measured with Trivy 0.73.0 on 2026-09-15, the Debian base carries 3 CRITICAL / 52 HIGH OS findings that belong to the distro (the newest `node:26-trixie-slim` scores identically) against 0 / 2 for `node:26-alpine` |
+| `-alpine-slim` | `Dockerfile.alpine-slim` | `alpine:3.23` with Alpine's own `nodejs` package | all except **DuckDB** | smallest; see the trade below |
+
+`-alpine-slim` trades features for size and is the only variant that does. It drops the DuckDB
+driver (four packages ending in a ~70 MB `libduckdb.so`) and sharp/libvips, and it runs Alpine's
+packaged Node rather than the official image's unstripped binary, which is the single largest
+saving. Opening a DuckDB connection
+on it fails with a message naming the tags that do ship the driver, not a module-resolution stack.
+Its Node version follows Alpine's package index rather than a Dependabot-tracked pin, and Alpine
+ships English-only ICU data — safe here because every server-side locale call in `src` passes
+`en-US` explicitly.
+
+Oracle **Thick** mode needs Oracle Instant Client, which has no musl build, so it is reachable on
+the default tag only — see [providers/oracle.md](providers/oracle.md).
+
+**All three prune the payload.** Next's output file tracing sweeps the repository root into
+`.next/standalone`, so every image used to unpack `src/`, `scripts/`, the lockfile and the tooling
+configs onto `/app`. Each Dockerfile now runs `scripts/lib/prune-standalone-payload.sh` in its
+builder stage — the same deny-list the release tarballs, `.deb`/`.rpm`, snap and the npx cache
+already share (#124) — so a new repo-root file leaves every artifact family through one edit.
 
 **Architectures:** every tag published from `main`, a release or a manual dispatch is a
 `linux/amd64` + `linux/arm64` manifest. Branch previews (`dev` and the `sha-` tag of a
@@ -784,9 +836,11 @@ sudo systemctl restart snap.libredb-studio.libredb-studio.service
 
 The drop-in is written to
 `/etc/systemd/system/snap.libredb-studio.libredb-studio.service.d/override.conf`
-(root-owned). Explicit values override the defaults baked into
-[`snap/snapcraft.yaml`](../snap/snapcraft.yaml) and take precedence over
-[zero-config first run](#zero-config-first-run) generation. Note that `systemctl edit`
+(root-owned). Explicit values override the defaults in
+[`snap/local/launch.sh`](../snap/local/launch.sh) and take precedence over
+[zero-config first run](#zero-config-first-run) generation. The snap manifest deliberately sets
+no environment: snap-exec applies a manifest `environment:` over the unit's, so a key set there
+would silently ignore the drop-in (#807). Note that `systemctl edit`
 creates the drop-in world-readable (mode 0644, like any systemd override), so after adding
 secrets tighten it — systemd reads drop-ins as root, so this does not affect the service:
 
@@ -802,8 +856,12 @@ Example drop-in (uncomment and fill what you need):
 #Environment=HOSTNAME=0.0.0.0
 
 # Auth (optional; omit to keep zero-config bootstrap)
+# JWT_SECRET must be 32+ chars: generate one with `openssl rand -base64 32` and
+# paste the output. systemd does not expand a command here, and Environment= is
+# split on whitespace, so a `$(...)` value is refused as an invalid environment
+# block - the service then fails to start at all.
 #Environment=AUTH_BOOTSTRAP=off
-#Environment=JWT_SECRET=change-me-to-a-random-32-char-string
+#Environment=JWT_SECRET=
 #Environment=ADMIN_EMAIL=admin@libredb.org
 #Environment=ADMIN_PASSWORD=
 
@@ -1669,6 +1727,14 @@ Neither Fly.io nor
 Render has a marketplace or template gallery to publish into, which is why the repo file itself is the
 deliverable (`pin.strategy: local_file` for the version-pinned `fly.toml`; `none` for
 `render.yaml`, which builds from the repo Dockerfile and tracks whatever `main` builds).
+
+**DigitalOcean measures the live listing**, not the Packer workflow's version
+input: its `remote_file` pin reads `custom_data.version` from the public
+Marketplace page. Drift and unreadable metadata remain visible in the weekly
+report without blocking a release. Snapshot builds and Vendor Portal updates
+stay manual and on demand; every successful `publish-release` job adds a
+versioned build, test, submit and verify checklist to its summary. See the
+[DigitalOcean build guide](../deploy/digitalocean/README.md).
 
 ### Manual steps still open
 

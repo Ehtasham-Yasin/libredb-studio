@@ -1037,11 +1037,70 @@ describe("AgentRunService — drive ownership", () => {
     const h = harness();
     const { runId } = await h.service.start(START_INPUT);
 
-    h.service.claimDrive(runId);
+    await h.service.claimDrive(runId);
     expect((await captureServiceError(async () => h.service.claimDrive(runId))).reasonCode).toBe("RUN_ALREADY_DRIVEN");
 
-    h.service.releaseDrive(runId);
-    h.service.claimDrive(runId);
-    h.service.releaseDrive(runId);
+    await h.service.releaseDrive(runId);
+    await h.service.claimDrive(runId);
+    await h.service.releaseDrive(runId);
+  });
+
+  test("a claim is durable: a second store over the same files folds it back", async () => {
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+
+    await h.service.claimDrive(runId);
+
+    // Observed through the ledger, not through the process-local guard: a fresh
+    // store over the same files folds the same claim back.
+    const view = await h.reader().read(runId);
+    expect(view?.driveClaim?.driveId).toBeTruthy();
+    expect(view?.driveClaim?.expiresAtMs).toEqual(expect.any(Number));
+  });
+
+  test("a release is durable too: the folded claim is gone", async () => {
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+
+    await h.service.claimDrive(runId);
+    await h.service.releaseDrive(runId);
+
+    expect((await h.reader().read(runId))?.driveClaim).toBeNull();
+  });
+});
+
+// ─── run history (#830) ────────────────────────────────────────────────────
+
+describe("AgentRunService — run history", () => {
+  test("finishing a run indexes it for the actor, and the service lists it back", async () => {
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+    await h.service.markRunning(runId);
+    await h.service.finish(runId, "succeeded");
+
+    const page = await h.service.listConversations(ACTOR.sessionId);
+
+    expect(page.conversations).toHaveLength(1);
+    expect(page.conversations[0]?.threadId).toBe(runId);
+    expect(page.conversations[0]?.steps[0]).toMatchObject({ runId, status: "succeeded" });
+    expect(page.nextCursor).toBeNull();
+  });
+
+  test("a history-index write that fails is logged, not fatal to the finish", async () => {
+    const h = harness();
+    const { runId } = await h.service.start(START_INPUT);
+    await h.service.markRunning(runId);
+
+    const errorSpy = spyOn(logger, "error");
+    const historySpy = spyOn(h.store, "recordHistoryFinish");
+    historySpy.mockRejectedValue(new Error("disk full"));
+    try {
+      const finished = await h.service.finish(runId, "succeeded");
+      expect(finished.status).toBe("succeeded");
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+      historySpy.mockRestore();
+    }
   });
 });

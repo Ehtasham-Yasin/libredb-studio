@@ -93,7 +93,7 @@ afterEach(() => {
 describe("the document Studio ships with", () => {
   test("passes its own contract", () => {
     const tuning = parseTuning(bundled, "test");
-    expect(Object.keys(tuning.models)).toHaveLength(30);
+    expect(Object.keys(tuning.models)).toHaveLength(35);
   });
 
   test("argues for every value it changed", () => {
@@ -237,6 +237,41 @@ describe("what a document from outside Studio is held to instead", () => {
     resetTuning();
     expect(ceilingFor("gemma4:26b")).toBe(DEFAULT_UNREPORTED_CALL_CEILING);
     expect(retriesEmptyTurn("gemma4:26b")).toBe(true);
+  });
+
+  test("an entry may state temperature without topP, suitable for Claude/Anthropic endpoints", () => {
+    const tempOnly = {
+      models: [{ id: "claude-haiku-4-5", measured: "temperature 0 only", settings: { sampling: { temperature: 0 } } }],
+    };
+    const tuning = parseOperatorTuning(document(tempOnly), "test");
+    expect(tuning.models["claude-haiku-4-5"]).toEqual({
+      measured: "temperature 0 only",
+      sampling: { temperature: 0 },
+    });
+  });
+
+  test("an entry may state topP without temperature", () => {
+    const topPOnly = {
+      models: [{ id: "custom-model:7b", measured: "topP 0.9 only", settings: { sampling: { topP: 0.9 } } }],
+    };
+    const tuning = parseOperatorTuning(document(topPOnly), "test");
+    expect(tuning.models["custom-model:7b"]).toEqual({
+      measured: "topP 0.9 only",
+      sampling: { topP: 0.9 },
+    });
+  });
+
+  test("an entry may state an empty sampling object for adaptive-thinking models", () => {
+    const emptySampling = {
+      models: [
+        { id: "claude-sonnet-5", measured: "adaptive thinking; no sampling params", settings: { sampling: {} } },
+      ],
+    };
+    const tuning = parseOperatorTuning(document(emptySampling), "test");
+    expect(tuning.models["claude-sonnet-5"]).toEqual({
+      measured: "adaptive thinking; no sampling params",
+      sampling: {},
+    });
   });
 
   test("a key this Studio does not implement is reported rather than refusing the document", () => {
@@ -563,7 +598,7 @@ describe("a document an operator supplies", () => {
     process.env[ENV] = writeDocument("{ not json");
     resetTuning();
     expect(ceilingFor("gemma4:26b")).toBe(10);
-    expect(Object.keys(activeTuning().models)).toHaveLength(30);
+    expect(Object.keys(activeTuning().models)).toHaveLength(35);
   });
 
   test("reports that it ignored a document, naming the file and the reason", () => {
@@ -717,13 +752,13 @@ describe("a document an operator supplies", () => {
   test("is ignored when it breaks the contract, not partially applied", () => {
     process.env[ENV] = writeDocument(document({ schemaVersion: 99 }));
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(30);
+    expect(Object.keys(activeTuning().models)).toHaveLength(35);
   });
 
   test("is ignored when the file is not there at all", () => {
     process.env[ENV] = "/nonexistent/models.json";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(30);
+    expect(Object.keys(activeTuning().models)).toHaveLength(35);
   });
 
   test("an unset or blank variable is simply no operator document", () => {
@@ -731,7 +766,7 @@ describe("a document an operator supplies", () => {
     // reading it as a path would warn on every boot of an install that configured nothing.
     process.env[ENV] = "   ";
     resetTuning();
-    expect(Object.keys(activeTuning().models)).toHaveLength(30);
+    expect(Object.keys(activeTuning().models)).toHaveLength(35);
   });
 
   test("is read once, so a run cannot see the table change under it", () => {

@@ -727,6 +727,36 @@ describe("useQueryAdapter", () => {
     expect(params.onQueryExecute).not.toHaveBeenCalled();
   });
 
+  /**
+   * The guard restates the condition the rendered control already enforces: the button is
+   * `disabled={isLoadingMore}` in `StatsBar` and the flag is wired end to end. It reads
+   * render state, not a ref, so it is a second line behind that control rather than a
+   * replacement for it - which is what this asserts, and all it asserts.
+   */
+  test("handleLoadMore returns early while a page is already in flight", () => {
+    const tabLoading = makeTab({
+      result: {
+        rows: [{ id: 1 }],
+        fields: ["id"],
+        rowCount: 1,
+        executionTime: 10,
+        pagination: { limit: 50, offset: 0, hasMore: true, totalReturned: 1, wasLimited: true },
+      },
+      currentOffset: 50,
+      isLoadingMore: true,
+    });
+    const { tabs, setTabs } = createMutableTabs([tabLoading]);
+    const params = makeHookParams({ tabs, setTabs, currentTab: tabLoading });
+
+    const { result } = renderHook(() => useQueryAdapter(params));
+
+    act(() => {
+      result.current.handleLoadMore();
+    });
+
+    expect(params.onQueryExecute).not.toHaveBeenCalled();
+  });
+
   // ── handleLoadMore appends rows on success ──────────────────────────────────
 
   test("handleLoadMore appends rows to the current tab and preserves other tabs", async () => {
@@ -810,6 +840,140 @@ describe("useQueryAdapter", () => {
     expect(tabs[0].isLoadingMore).toBe(false);
     expect(tabs[1].result).toBeNull();
     expect(mockToastError).toHaveBeenCalled();
+  });
+
+  // ── result pagination (#816) ────────────────────────────────────────────────
+
+  /**
+   * Page two is the size of page one, in BOTH shells.
+   *
+   * `limit: 500` was hardcoded at this call site. A table preview now asks for 50, so a
+   * hardcoded 500 made the second page ten times the first, and the footer's own label
+   * said "500 rows" while claiming to continue a 50-row page. The size to reuse is the
+   * one the result reports, which is the one the route applied.
+   */
+  test("handleLoadMore asks for the page size the first page came back with", async () => {
+    const tabWithMore = makeTab({
+      result: {
+        rows: [{ id: 1 }],
+        fields: ["id"],
+        rowCount: 1,
+        executionTime: 10,
+        pagination: { limit: 50, offset: 0, hasMore: true, totalReturned: 50, wasLimited: true },
+      },
+      currentOffset: 50,
+    });
+    const { tabs, setTabs } = createMutableTabs([tabWithMore]);
+    const onQueryExecute = mock(() => Promise.resolve(makeQueryResult()));
+
+    const { result } = renderHook(() =>
+      useQueryAdapter(makeHookParams({ onQueryExecute, tabs, setTabs, currentTab: tabWithMore })),
+    );
+
+    await act(async () => {
+      result.current.handleLoadMore();
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    expect(onQueryExecute).toHaveBeenCalledWith("conn-1", "SELECT * FROM users", { limit: 50, offset: 50 });
+  });
+
+  /**
+   * Criterion 8, the half a toast does not cover: a failed page must leave the rows and
+   * the offset exactly as they were, so a retry asks for the same page rather than
+   * skipping one. The standalone hook has the mirror of this test.
+   */
+  test("a failed page keeps the loaded rows and does not advance currentOffset", async () => {
+    const tabWithMore = makeTab({
+      result: {
+        rows: [{ id: 1 }, { id: 2 }],
+        fields: ["id"],
+        rowCount: 2,
+        executionTime: 10,
+        pagination: { limit: 50, offset: 0, hasMore: true, totalReturned: 2, wasLimited: true },
+      },
+      allRows: [{ id: 1 }, { id: 2 }],
+      currentOffset: 50,
+    });
+    const { tabs, setTabs } = createMutableTabs([tabWithMore]);
+    const onQueryExecute = mock(() => Promise.reject(new Error("connection reset")));
+
+    const { result } = renderHook(() =>
+      useQueryAdapter(makeHookParams({ onQueryExecute, tabs, setTabs, currentTab: tabWithMore })),
+    );
+
+    await act(async () => {
+      result.current.handleLoadMore();
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    expect(mockToastError).toHaveBeenCalled();
+    expect(tabs[0].result!.rows).toHaveLength(2);
+    expect(tabs[0].allRows).toHaveLength(2);
+    expect(tabs[0].currentOffset).toBe(50);
+    expect(tabs[0].isLoadingMore).toBe(false);
+  });
+
+  /**
+   * The channels a paged commit used to drop.
+   *
+   * The first-page commit spreads `carriedChannels(result)`; this one rebuilt the result
+   * from five keys and did not, so appending a page silently removed the engine warnings
+   * and the declared column types the first page had shown (#285's class, on the paging
+   * path). Pre-existing, in the exact commit #816 rewrites, so it is fixed here.
+   */
+  test("a paged commit keeps the warnings and column types the page carries", async () => {
+    const tabWithMore = makeTab({
+      result: {
+        rows: [{ id: 1 }],
+        fields: ["id"],
+        rowCount: 1,
+        executionTime: 10,
+        pagination: { limit: 50, offset: 0, hasMore: true, totalReturned: 1, wasLimited: true },
+        warnings: [{ message: "one shard was unavailable" }],
+        columnTypes: { id: "int4" },
+      },
+      currentOffset: 50,
+    });
+    const { tabs, setTabs } = createMutableTabs([tabWithMore]);
+    const nextPage = makeQueryResult({
+      rows: [{ id: 2 }],
+      pagination: { limit: 50, offset: 50, hasMore: false, totalReturned: 1, wasLimited: true },
+      warnings: [{ message: "one shard was unavailable" }],
+      columns: [{ name: "id", type: "int4" }],
+    });
+    const onQueryExecute = mock(() => Promise.resolve(nextPage));
+
+    const { result } = renderHook(() =>
+      useQueryAdapter(makeHookParams({ onQueryExecute, tabs, setTabs, currentTab: tabWithMore })),
+    );
+
+    await act(async () => {
+      result.current.handleLoadMore();
+      await new Promise((r) => setTimeout(r, 10));
+    });
+
+    expect(tabs[0].result!.columnTypes).toEqual({ id: "int4" });
+    expect(tabs[0].result!.warnings).toHaveLength(1);
+  });
+
+  /**
+   * The channel the preview cap travels down in the EMBEDDED shell.
+   *
+   * This `executeQuery` took no execution options at all and called `onQueryExecute` with
+   * none, so moving the preview bound out of the SQL text would have been a no-op here:
+   * the tree click would have asked for the route's default 500 rows. The host contract
+   * (`StudioWorkspaceProps.onQueryExecute`) has always accepted them.
+   */
+  test("executeQuery forwards its execution options to the host", async () => {
+    const onQueryExecute = mock(() => Promise.resolve(makeQueryResult()));
+    const { result } = renderHook(() => useQueryAdapter(makeHookParams({ onQueryExecute })));
+
+    await act(async () => {
+      await result.current.executeQuery("SELECT * FROM users", "tab-1", false, { limit: 50 });
+    });
+
+    expect(onQueryExecute).toHaveBeenCalledWith("conn-1", "SELECT * FROM users", { limit: 50 });
   });
 
   // ── handleUnlimitedQuery guards ─────────────────────────────────────────────
@@ -1022,5 +1186,92 @@ describe("useQueryAdapter", () => {
       expect(mockToastDefault).not.toHaveBeenCalled();
       expect(localStorage.getItem(COUNT_KEY)).toBe("9");
     });
+  });
+
+  // ── The statement a tab's rows came from (#881) ───────────────────────────
+  //
+  // `query` is the editor buffer and is rewritten on every keystroke, so it is not a safe
+  // name for the rows on screen. The standalone app pairs the two on `QueryTab`; this
+  // surface writes the same tab type and has to pair them too, or a tab ends up holding
+  // rows from two tables while naming one.
+
+  test("records the statement beside the result it fetched", async () => {
+    const params = makeHookParams();
+    const { result } = renderHook(() => useQueryAdapter(params as never));
+
+    await act(async () => {
+      await result.current.executeQuery("SELECT * FROM users WHERE id = 1");
+    });
+
+    expect(params.tabs[0].resultQuery).toBe("SELECT * FROM users WHERE id = 1");
+  });
+
+  test("records it on the force-execute path too", async () => {
+    const params = makeHookParams();
+    const { result } = renderHook(() => useQueryAdapter(params as never));
+
+    await act(async () => {
+      result.current.forceExecuteQuery("DELETE FROM users WHERE id = 1");
+    });
+
+    expect(params.tabs[0].resultQuery).toBe("DELETE FROM users WHERE id = 1");
+  });
+
+  test("records it on the unlimited-run path too", async () => {
+    const params = makeHookParams();
+    const { result } = renderHook(() => useQueryAdapter(params as never));
+
+    act(() => {
+      result.current.setPendingUnlimitedQuery({ query: "SELECT * FROM users", tabId: "tab-1" });
+    });
+    await act(async () => {
+      result.current.handleUnlimitedQuery();
+    });
+
+    expect(params.tabs[0].resultQuery).toBe("SELECT * FROM users");
+  });
+
+  test("Load More pages that statement, not whatever has been typed since", async () => {
+    const paged = makeQueryResult({
+      pagination: { limit: 500, offset: 0, hasMore: true, totalReturned: 2, wasLimited: false },
+    });
+    const tab = makeTab({
+      query: "SELECT * FROM orders",
+      resultQuery: "SELECT * FROM users",
+      result: paged,
+    });
+    const { tabs, setTabs } = createMutableTabs([tab]);
+    const params = makeHookParams({ tabs, setTabs, currentTab: tab });
+    const { result } = renderHook(() => useQueryAdapter(params as never));
+
+    await act(async () => {
+      result.current.handleLoadMore();
+    });
+
+    expect(params.onQueryExecute).toHaveBeenCalledWith("conn-1", "SELECT * FROM users", {
+      limit: 500,
+      offset: 2,
+    });
+    // And the appended page is still that statement's, so the tab keeps naming it.
+    expect(params.tabs[0].resultQuery).toBe("SELECT * FROM users");
+  });
+
+  test("names the statement on Load More for a tab that has no name for its rows yet", async () => {
+    // A tab whose result was built before this field existed has rows and no statement, and
+    // the page appended to it has to give the pair a name rather than leave the rows
+    // anonymous.
+    const paged = makeQueryResult({
+      pagination: { limit: 500, offset: 0, hasMore: true, totalReturned: 2, wasLimited: false },
+    });
+    const tab = makeTab({ query: "SELECT * FROM users", result: paged });
+    const { tabs, setTabs } = createMutableTabs([tab]);
+    const params = makeHookParams({ tabs, setTabs, currentTab: tab });
+    const { result } = renderHook(() => useQueryAdapter(params as never));
+
+    await act(async () => {
+      result.current.handleLoadMore();
+    });
+
+    expect(params.tabs[0].resultQuery).toBe("SELECT * FROM users");
   });
 });

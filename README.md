@@ -13,7 +13,8 @@
   <a href="README_zh.md">简体中文</a> ·
   <a href="README_ja.md">日本語</a> ·
   <a href="README_es.md">Español</a> ·
-  <a href="README_ur.md">اردو</a>
+  <a href="README_ur.md">اردو</a> ·
+  <a href="README_hi.md">हिन्दी</a>
 </p>
 
 <p align="center">
@@ -29,11 +30,14 @@
 <p align="center">
   Also listed in official
   <a href="https://redis.io/docs/latest/develop/tools/#libredb-studio">Redis</a>,
-  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>
+  <a href="https://clickhouse.com/docs/integrations/connectors/tools/gui#libredb-studio">ClickHouse</a>,
   <a href="https://mariadb.com/docs/server/clients-and-utilities/graphical-and-enhanced-clients/libredb-studio">MariaDB</a>,
-  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>
+  <a href="https://trino.io/ecosystem/client-application#libredb-studio">Trino</a>,
+  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>,
+  <a href="https://docs.yugabyte.com/stable/integrations/tools/libredb-studio/">YugabyteDB</a>,
+  <a href="https://www.dragonflydb.io/docs/integrations/libredb-studio">DragonflyDB</a>
   and
-  <a href="https://cloudberry.apache.org/docs/ecosystem/sql-clients/libredb-studio/">Apache Cloudberry</a>
+  <a href="https://opensearch.org/community-projects/">OpenSearch</a>
   docs
 </p>
 
@@ -79,6 +83,8 @@ npx @libredb/studio
 ```
 
 Then open **http://localhost:3000**. On first run, the admin password is printed to the log (zero-config).
+
+> If the browser reaches Studio at anything other than localhost or HTTPS (`http://192.168.x.x:3000` on a LAN, for example), also set `AUTH_COOKIE_SECURE=false`. Without it the health check passes while login fails silently and sends you back to the login page.
 
 > Need Helm, Homebrew, Snap, winget, or deb/rpm? See [all install options](#getting-started).
 
@@ -155,21 +161,26 @@ what comes back, and finishes by composing a report whose every claim cites the 
   goes through the agent's own audited pipeline — a policy decision, an audit event and budget
   accounting before the driver is touched (`executeAuditedOperation`, `src/lib/db/operations/execution.ts:129`)
   — under a read-only execution profile: a read-only transaction on PostgreSQL, `PRAGMA query_only`
-  re-asserted per statement on SQLite, and a `READ_ONLY` engine handle on DuckDB paired with an
+  re-asserted per statement on SQLite, a `READ_ONLY` engine handle on DuckDB paired with an
   SQL-level guard, because that flag alone still lets `COPY … TO`, `EXPORT DATABASE` and the
-  local-file table functions through. Writes and DDL are refused before the database is reached,
+  local-file table functions through, and, on SQL Server, which has no read-only transaction of any
+  kind, a session principal verified at open to be unable to write, an optimizer admission that
+  compiles each statement without running it, a server-side row bound, and a transaction that is
+  always rolled back. Writes and DDL are refused before the database is reached,
   and `EXPLAIN ANALYZE` is default-denied because it would run the statement. This pipeline is the
   agent's alone: statements you run yourself in the editor call the provider directly
   (`src/app/api/db/query/route.ts:44`) and are neither policy-checked nor audited this way.
-- **Agent mode reads PostgreSQL, SQLite and DuckDB only.** The read-only profile is database-native,
-  so it exists only where a provider implements it — `queryReadOnly` on `postgres.ts:915`,
-  `sqlite.ts:537` and `duckdb/index.ts:525`, and nowhere else. On any other engine, an Agent-mode run ends `engine-unsupported`
-  (`src/lib/agent/runtime.ts:199`). **Plan** mode opens on every connection — the model there is
-  toolless, runs no statement of yours, writes nothing, and drafts a statement for you to run
-  yourself. Its GROUNDING reaches every engine: on PostgreSQL and SQLite the server composes catalog
-  statements itself, and on every other connection it asks that connection's own provider to describe its
+- **Agent mode reads PostgreSQL, SQLite, DuckDB and SQL Server only.** The read-only profile is
+  database-native, so it exists only where a provider implements it — `queryReadOnly` on
+  `postgres.ts`, `sqlite.ts`, `duckdb/index.ts` and `mssql.ts`, and nowhere else. On any other engine
+  an Agent-mode run whose workflow sends statements is refused when it is started, before a run is
+  opened, and any that reaches the provider factory ends `engine-unsupported`. **Plan** mode opens on
+  every connection — the model there is toolless, runs no statement of yours, writes nothing, and
+  drafts a statement for you to run yourself. Its GROUNDING reaches every engine: on PostgreSQL and
+  SQLite the server composes catalog statements itself, and on every other connection it asks that
+  connection's own provider to describe its
   schema — the reading the sidebar already performs — which needs no read-only statement path. So the
-  two limits are separate: agent mode is those three engines, grounding is all of them, and a run whose
+  two limits are separate: agent mode is those four engines, grounding is all of them, and a run whose
   reading fails says so plainly rather than inventing tables.
 - **Three workflows**: **Investigate** (answer a question), **Optimize** (compare estimated plans,
   propose an index or a rewrite), **Assess** (profile tables — counts only, never values).
@@ -177,8 +188,9 @@ what comes back, and finishes by composing a report whose every claim cites the 
   never executes what it recommends. Applying a statement is your click.
 - **Evidence or nothing.** A claim with no citation cannot be composed, and the run states its own
   verdict — *"Run answered"* or *"Run did not answer"* — beside how it ended.
-- **Bounded, and the meter is on screen**: 20 statements, 60 s of database time, 200 rows per read,
-  a 5-minute run deadline.
+- **Bounded, and the meter is on screen**: 18 to 45 statements and a 360 s to 900 s run deadline
+  depending on workflow, 200 rows per read. See [docs/AGENT.md](docs/AGENT.md) for the exact figures
+  per workflow.
 - **Your own model.** Gemini (the default), OpenAI, Ollama, or any OpenAI-compatible endpoint.
   **Agent** mode needs a model that can call tools — on Ollama, a live probe, not the vendor's page,
   is what establishes that, and the guide says how to run one. **Plan** mode needs no tools and is
@@ -207,7 +219,7 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 - **Inline Editing**: Double-click to update values directly in the grid, on engines whose SQL has a single-table row update (the control is hidden elsewhere).
 - **Column Filtering**: Per-column text filters on query results for instant data exploration.
 - **Interactive Pivot Table**: Client-side pivoting with 5 aggregation functions (COUNT, SUM, AVG, MIN, MAX) and SQL generation.
-- **Expert Exporter**: Instant CSV and JSON exports for reporting. CSV import and result export offer comma (default), semicolon and tab separators.
+- **Expert Exporter**: Instant CSV and JSON exports for reporting. CSV import and result export offer comma (default), semicolon and tab separators. Every format the Export menu writes to a file it also copies straight to the clipboard.
 
 ### Advanced Data Visualization
 - **8 Chart Types**: Bar, Line, Pie, Area, Scatter, Histogram, Stacked Bar, and Stacked Area charts powered by Recharts.
@@ -220,7 +232,7 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 - **Column-Name Pattern Matching**: 10 built-in patterns (email, phone, credit card, SSN, password, IP, date, financial, and more) match **result column headers** by regex. Works when the output name matches (e.g., `SELECT salary`). Aliases (`salary AS x`) and aggregates (`SUM(salary)`) are not masked today.
 - **Configurable Rules**: Admin panel to add, edit, enable/disable masking patterns. Email, phone, credit card and SSN presets prefill the Add Pattern form so column patterns can be adapted before saving. Custom patterns support regex. Settings stored per-browser in localStorage.
 - **RBAC UI Controls**: User role cannot toggle or reveal masked cells in the UI. Admin role can toggle masking and temporarily reveal individual cells (10s auto-hide).
-- **Export & Clipboard**: CSV, JSON, and SQL INSERT exports use masked display values when masking is active in the UI. This does not prevent access to raw data via the API, browser DevTools, or admin reveal.
+- **Export & Clipboard**: CSV, JSON, and SQL INSERT exports, whether saved as a file or copied to the clipboard, use masked display values when masking is active in the UI. This does not prevent access to raw data via the API, browser DevTools, or admin reveal.
 - **UI Coverage**: Grid, mobile card/table views, row detail sheet, and clipboard copy respect the active display mask.
 
 ### Analyst & Developer Tools
@@ -242,6 +254,7 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 ### Authentication & SSO
 - **Dual Auth Modes**: Local email/password login or OpenID Connect (OIDC) Single Sign-On; switchable via environment variable.
 - **Vendor-Agnostic OIDC**: Works with any OIDC-compliant provider — Auth0, Keycloak, Okta, Azure AD, Zitadel, Google, and more.
+- **One-Command SSO Demo**: `docker compose -f docker-compose.oidc-demo.yml up` starts Studio with a preconfigured Keycloak so you can try SSO and role mapping locally ([walkthrough](docs/OIDC.md#try-it-locally-with-keycloak)).
 - **PKCE Security**: Authorization Code Flow with Proof Key for Code Exchange (S256) for secure authentication.
 - **Auto Role Mapping**: Configurable claim-based role mapping with dot-notation for nested claims (e.g., `realm_access.roles`).
 - **Provider Logout**: Logout clears both the local JWT session and identity provider session.
@@ -278,7 +291,7 @@ Standalone application only: the embedded `@libredb/studio` package carries no a
 | **Apache Cassandra** | `cassandra-driver` (pure JS, no native module) | CQL IDE over the native protocol (port 9042), keyspace browser marking partition and clustering keys, `system_views` overview, uptime and running statements. No EXPLAIN (the keyword is not in CQL), no cancellation (the protocol has none), no maintenance (every operation is a `nodetool` action), and **no row counts or sizes**: the only figures Cassandra publishes are partition estimates from flushed files and whole mebibytes, so neither is shown rather than shown wrong |
 | **Redis** | `ioredis` | Command editor, key browser, INFO-based monitoring |
 
-> **Twenty-six more engines have no driver of their own.** The sixteen above are the drivers this build ships. Twenty-six further engines speak one of those wire protocols and connect through an existing driver unchanged, so sixteen drivers reach forty-two named engines in all. They are MariaDB, Percona Server for MySQL, TiDB, Vitess, StarRocks, Apache Doris, OceanBase, SingleStore, Databend, Citus, Percona Distribution for PostgreSQL, ParadeDB, OrioleDB, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry (incubating), CockroachDB, Materialize and RisingWave (as PostgreSQL or MySQL), Valkey, DragonflyDB, KeyDB and Garnet (as Redis), FerretDB (as MongoDB), and ScyllaDB (as Cassandra). Each was measured against a live instance, and how much of the product works differs per engine. MariaDB, both Percona distributions, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, ParadeDB, OrioleDB, Valkey, DragonflyDB, KeyDB and FerretDB behave as their driver's own engine, though three of them report statistics you should not trust: a Citus distributed table and a TimescaleDB hypertable report row counts and sizes that are wrong rather than missing, and YugabyteDB reports 0 until you run `ANALYZE`. Vitess is not one of those three, its row counts and sizes being exact to the byte, but a running query cannot be cancelled there: vtgate refuses `KILL QUERY` and the statement runs to completion. AlloyDB Omni is not one of them either, reporting 2000 rows for 2000 and 270336 bytes for 270336, but two things there surprise: `version()` names AlloyDB nowhere, so the version panel cannot be told apart from a stock PostgreSQL 17, and eight of AlloyDB's own `google_ml` tables list in the object browser, which any role that can connect at all may also read. StarRocks reports itself as MySQL 5.1 and loses its overview, health and session panels, its monitoring dashboard rendering six panels with the session one carrying the engine's own refusal; Apache Doris - the engine StarRocks is a fork of - loses only the overview and health panels, to one statement form its grammar rejects, and is the more trustworthy of the two where it counts: it reports 2000 rows and 10187 bytes for a table holding exactly that, where StarRocks reports zeros, though a freshly loaded table there reads 0 for about a minute before its background statistics land, no index is ever reported, and a foreign key is accepted, listed by `SHOW CONSTRAINTS`, invisible to the ER diagram and unenforced; Cloudberry loses the monitoring dashboard and its table and index statistics, all three to one MPP planner restriction, and reads a foreign key back as though it were enforced when it is not, though its row counts are correct; CockroachDB loses the object browser and the size panels; OceanBase answers fourteen of the fifteen surfaces but only twelve of them usefully, health failing outright because its tenant has no `performance_schema` database at all and every size reading 0 B, though its row counts are correct once `ANALYZE TABLE` has run; SingleStore lost five surfaces to a cause that was ours rather than its own - the provider sent every statement through the prepared-statement protocol, which SingleStore refuses for the `SHOW` and `EXPLAIN` statements four panels need - and four of those five are now recovered, its Explain panel being the one that is not, because there the grammar wants `EXPLAIN JSON` and the statement fails on either protocol; its numbers are still missing rather than wrong, a 2000-row table reading 0 rows and 0 B with no `ANALYZE` able to change it; ScyllaDB loses five surfaces and Test Connection with them, all six to one absent keyspace - the overview, health, performance-metrics, active-session and monitoring panels read Cassandra's `system_views` virtual tables and ScyllaDB has no `system_views` keyspace at all - those five now degrade to empty rather than throwing, so Test Connection passes and the dialog saves the connection, which it could not do at all until that change - while the editor and the object browser work in full, every one of 18 CQL types reading back byte-identically to the Cassandra 5.0.9 probed in the same pass; ParadeDB and OrioleDB are both full and their costs are opposites: ParadeDB's nine extensions put 41 objects in the object browser for 2 user tables and break agent plan mode on a stock install, while OrioleDB's browser is clean and its own storage is invisible to PostgreSQL's size functions, so every index reads 0 bytes and the cache hit ratio reads N/A. Materialize, RisingWave and Databend are query-editor-only, and Databend is the one of those three whose catalogs answer perfectly well when asked directly - the object browser is empty because our parameterised reads use a prepared protocol it does not implement. Garnet behaves as Redis and is one of three relatives here (with Valkey and DragonflyDB) whose own version `INFO` carries beside the Redis compat level and the overview now labels ahead of it - `Garnet 2.1.5 (Redis 7.4.3)` - and two of its readings are absences wearing a value, every size showing 0 B because it publishes no `used_memory` and the cache hit ratio showing 100% because it publishes no keyspace counters. The per-engine detail, with the exact version probed, is in [`docs/providers/README.md`](docs/providers/README.md#wire-compatible-engines) — we publish a name only after connecting to it, so a name absent there is untested rather than unsupported.
+> **Twenty-six more engines have no driver of their own.** The sixteen above are the drivers this build ships. Twenty-six further engines speak one of those wire protocols and connect through an existing driver unchanged, so sixteen drivers reach forty-two named engines in all. They are MariaDB, Percona Server for MySQL, TiDB, Vitess, StarRocks, Apache Doris, OceanBase, SingleStore, Databend, Citus, Percona Distribution for PostgreSQL, ParadeDB, OrioleDB, TimescaleDB, YugabyteDB, AlloyDB Omni, Apache Cloudberry (incubating), CockroachDB, Materialize and RisingWave (as PostgreSQL or MySQL), Valkey, DragonflyDB, KeyDB and Garnet (as Redis), FerretDB (as MongoDB), and ScyllaDB (as Cassandra). Each was measured against a live instance, and how much of the product works differs per engine. MariaDB, both Percona distributions, TiDB, Vitess, AlloyDB Omni, Citus, TimescaleDB, YugabyteDB, ParadeDB, OrioleDB, Valkey, DragonflyDB, KeyDB and FerretDB behave as their driver's own engine, though three of them report statistics you should not trust: a Citus distributed table and a TimescaleDB hypertable report row counts and sizes that are wrong rather than missing, and YugabyteDB reports 0 until you run `ANALYZE`. Vitess is not one of those three, its row counts and sizes being exact to the byte, but a running query cannot be cancelled there: vtgate refuses `KILL QUERY` and the statement runs to completion. AlloyDB Omni is not one of them either, reporting 2000 rows for 2000 and 270336 bytes for 270336, but two things there surprise: `version()` names AlloyDB nowhere, so the version panel cannot be told apart from a stock PostgreSQL 17, and eight of AlloyDB's own `google_ml` tables list in the object browser, which any role that can connect at all may also read. StarRocks reports itself as MySQL 5.1 and loses its overview, health and session panels, its monitoring dashboard rendering six panels with the session one carrying the engine's own refusal; Apache Doris - the engine StarRocks is a fork of - loses only the overview and health panels, to one statement form its grammar rejects, and is the more trustworthy of the two where it counts: it reports 2000 rows and 10187 bytes for a table holding exactly that, where StarRocks reads zero at first too - its own background statistics collector is slower, measured 4.5 minutes against 3.3.22 where Doris's is about a minute - and, until a 2026-09-16 fix, read zero forever afterward for sizes specifically, because StarRocks' `INDEX_LENGTH` is NULL rather than Doris's real 0 and poisoned the sum the provider computed in SQL; no index is ever reported, and a foreign key is accepted, listed by `SHOW CONSTRAINTS`, invisible to the ER diagram and unenforced; Cloudberry loses the monitoring dashboard and its table and index statistics, all three to one MPP planner restriction, and reads a foreign key back as though it were enforced when it is not, though its row counts are correct; CockroachDB loses the object browser and the size panels; OceanBase answers fourteen of the fifteen surfaces but only twelve of them usefully, health failing outright because its tenant has no `performance_schema` database at all and every size reading 0 B, though its row counts are correct once `ANALYZE TABLE` has run; SingleStore lost five surfaces to a cause that was ours rather than its own - the provider sent every statement through the prepared-statement protocol, which SingleStore refuses for the `SHOW` and `EXPLAIN` statements four panels need - and four of those five are now recovered, its Explain panel being the one that is not, because there the grammar wants `EXPLAIN JSON` and the statement fails on either protocol; its numbers are still missing rather than wrong, a 2000-row table reading 0 rows and 0 B with no `ANALYZE` able to change it; ScyllaDB loses five surfaces and Test Connection with them, all six to one absent keyspace - the overview, health, performance-metrics, active-session and monitoring panels read Cassandra's `system_views` virtual tables and ScyllaDB has no `system_views` keyspace at all - those five now degrade to empty rather than throwing, so Test Connection passes and the dialog saves the connection, which it could not do at all until that change - while the editor and the object browser work in full, every one of 18 CQL types reading back byte-identically to the Cassandra 5.0.9 probed in the same pass; ParadeDB and OrioleDB are both full and their costs are opposites: ParadeDB's nine extensions put 41 objects in the object browser for 2 user tables and break agent plan mode on a stock install, while OrioleDB's browser is clean and its own storage is invisible to PostgreSQL's size functions, so every index reads 0 bytes and the cache hit ratio reads N/A. Materialize, RisingWave and Databend are query-editor-only, and Databend is the one of those three whose catalogs answer perfectly well when asked directly - the object browser is empty because our parameterised reads use a prepared protocol it does not implement. Garnet behaves as Redis and is one of three relatives here (with Valkey and DragonflyDB) whose own version `INFO` carries beside the Redis compat level and the overview now labels ahead of it - `Garnet 2.1.5 (Redis 7.4.3)` - and two of its readings are absences wearing a value, every size showing 0 B because it publishes no `used_memory` and the cache hit ratio showing 100% because it publishes no keyspace counters. The per-engine detail, with the exact version probed, is in [`docs/providers/README.md`](docs/providers/README.md#wire-compatible-engines) — we publish a name only after connecting to it, so a name absent there is untested rather than unsupported.
 
 > **Transport security is cross-cutting, not per engine.** The SSH tunnel is opened before the provider connects and the connection is rewritten to the local endpoint, so it is provider-independent: it applies to any connection configured with a host and a port. A connection entered as a connection string instead (an option for MongoDB, Couchbase, ClickHouse and libSQL) carries neither, so it is not tunnelled; SQLite and DuckDB have neither either. The SSL/TLS panel is honoured by every engine that shows it — which is every engine except the three file-based ones, SQLite, DuckDB and the embedded LibreDB, where no transport exists to secure and no panel is offered. On Trino it is load-bearing rather than optional, because the coordinator refuses a password over plain HTTP. Oracle is the one engine whose mapping carries a caveat worth stating up front: its Thin driver always verifies the certificate chain, so `require` needs the server's CA supplied when that certificate is self-signed, and a connect string pasted whole keeps whatever protocol it names.
 
@@ -336,18 +349,16 @@ docker run \
   --name libredb-studio \
   -p 3000:3000 \
   -e ADMIN_EMAIL=admin@libredb.org \
-  -e ADMIN_PASSWORD=LibreDB.2026 \
-  -e USER_EMAIL=user@libredb.org \
-  -e USER_PASSWORD=LibreDB.2026 \
-  -e JWT_SECRET=change-me-to-a-random-32-char-string \
   ghcr.io/libredb/libredb-studio:latest
 ```
 
   > **Registry**: `ghcr.io/libredb/libredb-studio` is the primary image (no pull rate limits — preferred for Kubernetes/CI). The same image is also mirrored to Docker Hub as [`libredb/libredb-studio`](https://hub.docker.com/r/libredb/libredb-studio?tag=latest) for convenience.
 
+  > **Variants**: every tag also ships on Alpine. `:latest-alpine` is the same product on a musl base with a much smaller OS attack surface, and `:latest-alpine-slim` is smaller still in exchange for the DuckDB driver. The default tag stays Debian and is the only one where Oracle Thick mode can be layered on — [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md#image-tag-model) has the table.
+
   > **IPv6**: the container picks its own bind address at startup and prefers `::`, which serves IPv4 and IPv6 through one socket — so an IPv6-only host needs no flags. It falls back to `0.0.0.0` where the namespace has no usable IPv6, and logs which it chose. Add `-e HOSTNAME=0.0.0.0` to pin it to IPv4 — details, and the Kubernetes equivalent, in [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md#network-exposure-bind-address).
 
-  Open [http://localhost:3000](http://localhost:3000) and login with `admin@libredb.org` / `LibreDB.2026`.
+  Open [http://localhost:3000](http://localhost:3000). The command above sets no password, so the first start generates one and prints it to the container log with `docker logs libredb-studio` — sign in as `admin@libredb.org` with the password it printed, or set `ADMIN_PASSWORD` yourself.
 
   > **Auth env vars (local provider):** `ADMIN_PASSWORD` and `JWT_SECRET` are only required when `AUTH_BOOTSTRAP=off`; otherwise both are generated on first start (see [Zero-config first run](#zero-config-first-run) below). `USER_EMAIL` / `USER_PASSWORD` are optional; omit them to run admin-only (no default user password is ever assumed). `ADMIN_EMAIL` defaults to `admin@libredb.org`. Using OIDC (`NEXT_PUBLIC_AUTH_PROVIDER=oidc`)? None of these are needed.
 
@@ -406,9 +417,7 @@ journalctl -u libredb-studio
        ```env
        # Authentication (email/password)
        ADMIN_EMAIL=admin@libredb.org
-       ADMIN_PASSWORD=your_admin_password
        USER_EMAIL=user@libredb.org
-       USER_PASSWORD=your_user_password
        JWT_SECRET=your_32_character_random_string
 
        # Optional: OIDC Single Sign-On (Auth0, Keycloak, Okta, Azure AD, etc.)
@@ -540,23 +549,30 @@ Sample tables: `app.customers`, `app.products`, `app.orders`, `app.order_items`,
 
 ## Testing
 
-LibreDB Studio has a comprehensive test suite with **3,000+ unit/integration tests** and **32 E2E tests** across 6 layers, with **100% line coverage** enforced by CI (`bun run coverage:check`).
+LibreDB Studio has a comprehensive test suite: 549 test files and 17,692 tests across seven layers, plus 79 browser tests, with **100% line coverage** enforced by CI (`bun run coverage:check`).
 
 ### Quick Commands
 
 ```bash
-# Run all tests (unit + API + integration + hooks + components)
+# Every test file, each in its own bun process
 bun run test
 
 # Run by layer
-bun run test:unit          # Pure function tests (1,600+ cases)
-bun run test:api           # API route handler tests (270+ cases)
-bun run test:integration   # Database provider tests (340+ cases)
-bun run test:hooks         # React hook tests (250+ cases)
-bun run test:components    # Component tests with mock isolation (570+ cases)
+bun run test:unit          # Pure function tests (328 files)
+bun run test:api           # API route handler tests (35 files)
+bun run test:integration   # Database provider tests (24 files)
+bun run test:hooks         # React hook tests (21 files)
+bun run test:security      # Security posture tests (21 files)
+bun run test:evals         # LLM prompt evaluation tests (13 files)
+bun run test:components    # Component tests (107 files: tests/components and tests/isolated)
+
+# Any subset, and what the runner would run
+bun tests/run-tests.ts tests/integration/db/duckdb-provider.test.ts
+bun tests/run-tests.ts --list
+bun tests/run-tests.ts --jobs=4          # bound the concurrency
 
 # E2E tests (requires build)
-bun run test:e2e           # Playwright browser tests (32 cases)
+bun run test:e2e           # Playwright browser tests (79 cases across chromium and webkit)
 
 # Coverage report (lcov)
 bun run test:coverage
@@ -564,24 +580,31 @@ bun run test:coverage
 
 ### Test Architecture
 
-| Layer | Directory | Runner | Tests | What it covers |
-|-------|-----------|--------|-------|----------------|
-| **Unit** | `tests/unit/` | `bun:test` | ~1,609 | Pure functions: SQL parser, connection strings, data masking, query limiter, schema diff, error classes, DB icons, showcase queries |
-| **API** | `tests/api/` | `bun:test` | ~279 | Route handlers: auth, query, transaction, maintenance, AI endpoints, middleware |
-| **Integration** | `tests/integration/` | `bun:test` | ~346 | Database providers: PG, MySQL, SQLite, MongoDB, Couchbase, Redis, Oracle, MSSQL, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino |
-| **Hooks** | `tests/hooks/` | `bun:test` | ~251 | React hooks: auth, connections, tabs, query execution, transactions, inline editing, monitoring |
-| **Components** | `tests/components/` | `bun:test` + happy-dom | ~570 | UI components: Studio, Sidebar, QueryEditor, ResultsGrid, Admin Dashboard, Charts, ERD |
-| **E2E** | `e2e/` | Playwright | ~32 | Full browser flows: login, connections, query execution, tabs, export, admin |
+| Layer | Directory | Files | Tests | What it covers |
+|-------|-----------|-------|-------|----------------|
+| **Unit** | `tests/unit/` | 328 | 9,645 | Pure functions: SQL parser, connection strings, data masking, query limiter, schema diff, error classes, DB icons, showcase queries, and the packaging and chart manifests |
+| **API** | `tests/api/` | 35 | 602 | Route handlers: auth, query, transaction, maintenance, AI endpoints, middleware |
+| **Integration** | `tests/integration/` | 24 | 2,768 | Database providers: PG, MySQL, SQLite, MongoDB, Couchbase, Redis, Oracle, MSSQL, ClickHouse, Druid, Elasticsearch, OpenSearch, Trino |
+| **Hooks** | `tests/hooks/` | 21 | 566 | React hooks: auth, connections, tabs, query execution, transactions, inline editing, monitoring |
+| **Security** | `tests/security/` | 21 | 322 | The posture `docs/SECURITY.md` claims: route exposure, headers, audit channels, credential handling |
+| **Evals** | `tests/evals/` | 13 | 198 | LLM prompt behaviour against recorded models |
+| **Components** | `tests/components/`, `tests/isolated/` | 107 | 3,376 | UI components with `happy-dom`: Studio, Sidebar, QueryEditor, ResultsGrid, Admin Dashboard, Charts, ERD |
+| **E2E** | `e2e/` | 18 | 79 | Full browser flows: login, connections, query execution, tabs, export, admin |
+
+The Files column was counted on 2026-09-15 with `bun tests/run-tests.ts --list` for the first seven rows and `playwright test --list` for the last.
+The Tests column comes from an earlier full run the same day, over the 542 files the tree held then, so the per-layer numbers are a little below the 17,692 above: they do not yet count the seven test files this branch and the merge from main add under `tests/unit/`, nor the cases this branch adds to the runner's own test files.
+The nineteenth spec in `e2e/`, `base-path.spec.ts`, is not in that 18: it needs its own server configuration and runs as `bun run test:e2e:base-path`.
 
 ### Key Details
 
-- **Test runner**: `bun:test` (built-in, Jest-compatible API) with `happy-dom` for DOM environment
-- **Component isolation**: Component tests run in 6 isolated groups via `tests/run-components.sh` to prevent `mock.module()` cross-contamination
+- **Test runner**: [`tests/run-tests.ts`](tests/run-tests.ts) over `bun:test`. It discovers every `*.test.ts` and `*.test.tsx` file under `tests/` except `tests/live/`, so a new test file runs the moment it is added, and it runs each file in its own bun process, several at a time (one per CPU by default, `--jobs=N` to change it).
+- **Why a process per file**: bun's `mock.module()` is process-wide with no undo, and whole-module mocks are the standard pattern in `tests/api/`, so files that share a process contaminate each other. On Linux with 20 cores and bun 1.4.2, the suite took 211 seconds one file at a time, 61 seconds 4 at a time and 36 seconds 20 at a time, measured on 2026-09-15 over the 538 files the tree held then; `docs/BACKLOG.md` D86 carries the same three timings and the same basis.
+- **One command everywhere**: the runner is TypeScript rather than shell so that the command a contributor is told to run works on Linux, macOS and Windows from the platform's own shell. The bash scripts it replaced did not: one used `mapfile`, a bash 4 builtin that macOS's bash 3.2 does not have.
 - **E2E**: Playwright runs the full suite on Chromium and the `security-headers` spec on WebKit (`webkit-security`), against a production build (`bun run build && bun start`)
-- **CI**: GitHub Actions runs lint + typecheck + build, unit/integration tests with coverage, E2E tests, and SonarCloud analysis
-- **Coverage**: `bun test --coverage` generates lcov reports for SonarCloud integration
+- **CI**: GitHub Actions runs lint + typecheck + build, the required `Unit & Integration Tests` job (`bun run test:coverage` then `bun run coverage:check`) on ubuntu, a non-required `Cross-platform Tests` job running `bun run test` on windows-latest and macos-latest, E2E tests, and SonarCloud analysis
+- **Coverage**: `bun run test:coverage` is the same runner with `--coverage`, which writes one lcov per test file; `scripts/merge-lcov.mjs` merges them into `coverage/lcov.info` for the gate and for SonarCloud
 
-> **Important**: Always use `bun run test` instead of bare `bun test`. The test script handles proper isolation between test groups.
+> **Important**: Always use `bun run test`, never bare `bun test` over a directory. `bun test tests/api` puts every file in one process, where one file's module mock becomes every file's. To run a single file, name it to the runner: `bun tests/run-tests.ts tests/api/proxy.test.ts`.
 
 ---
 
@@ -589,7 +612,7 @@ bun run test:coverage
 
 Deploy your own instance of LibreDB Studio with a single click on DigitalOcean, Koyeb, Render, Railway, Sealos, CapRover, or Dokploy:
 
- [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=libredb-studio&type=docker&image=ghcr.io%2Flibredb%2Flibredb-studio%3Alatest&instance_type=free&regions=fra&instances_min=0&autoscaling_sleep_idle_delay=3900&env%5BADMIN_EMAIL%5D=admin%40libredb.org&env%5BADMIN_PASSWORD%5D=LibreDB.2026&env%5BJWT_SECRET%5D=replace_with_openssl_rand_base64_32&env%5BLLM_API_KEY%5D=your_GEMINI_API_KEY&env%5BLLM_MODEL%5D=gemini-2.5-flash&env%5BLLM_PROVIDER%5D=gemini&env%5BNEXT_PUBLIC_AUTH_PROVIDER%5D=local&env%5BSTORAGE_PROVIDER%5D=local&env%5BUSER_EMAIL%5D=user%40libredb.org&env%5BUSER_PASSWORD%5D=LibreDB.2026&ports=3000%3Bhttp%3B%2F&hc_protocol%5B3000%5D=tcp&hc_grace_period%5B3000%5D=5&hc_interval%5B3000%5D=30&hc_restart_limit%5B3000%5D=3&hc_timeout%5B3000%5D=5&hc_path%5B3000%5D=%2F&hc_method%5B3000%5D=get)  
+ [![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=libredb-studio&type=docker&image=ghcr.io%2Flibredb%2Flibredb-studio%3Alatest&instance_type=free&regions=fra&instances_min=0&autoscaling_sleep_idle_delay=3900&env%5BADMIN_EMAIL%5D=admin%40libredb.org&env%5BJWT_SECRET%5D=set_a_real_secret&env%5BLLM_API_KEY%5D=your_GEMINI_API_KEY&env%5BLLM_MODEL%5D=gemini-2.5-flash&env%5BLLM_PROVIDER%5D=gemini&env%5BNEXT_PUBLIC_AUTH_PROVIDER%5D=local&env%5BSTORAGE_PROVIDER%5D=local&ports=3000%3Bhttp%3B%2F&hc_protocol%5B3000%5D=tcp&hc_grace_period%5B3000%5D=5&hc_interval%5B3000%5D=30&hc_restart_limit%5B3000%5D=3&hc_timeout%5B3000%5D=5&hc_path%5B3000%5D=%2F&hc_method%5B3000%5D=get)  
  [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/libredb/libredb-studio)  
  [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/libredb-studio?referralCode=libredb&utm_medium=integration&utm_source=template&utm_campaign=generic)  
  [![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/libredb-studio)  
@@ -602,7 +625,7 @@ Deploy your own instance of LibreDB Studio with a single click on DigitalOcean, 
 >
 > **CapRover:** open your CapRover dashboard → **Apps → One-Click Apps/Databases**, search for **LibreDB Studio**, and deploy.
 >
-> **Koyeb:** set a strong `JWT_SECRET` (at least 32 characters — `openssl rand -base64 32`) and credentials before deploying (Koyeb cannot auto-generate secrets); the prefilled values are placeholders, and a secret under 32 characters makes the app exit at startup. The button uses `STORAGE_PROVIDER=local` — connection metadata lives in the browser, which suits Koyeb's ephemeral filesystem. For persistence across redeploys, switch to `STORAGE_PROVIDER=postgres` and point `STORAGE_POSTGRES_URL` at a Koyeb managed Postgres or Neon database. See [`deploy/koyeb/`](deploy/koyeb/).
+> **Koyeb:** set a strong `JWT_SECRET` (at least 32 characters — `openssl rand -base64 32`) and credentials before deploying (Koyeb cannot auto-generate secrets). The prefilled values are deliberately unusable: the secret is shorter than the 32-character minimum, so the app stops at boot and says so rather than running on a secret printed in this file. The button uses `STORAGE_PROVIDER=local` — connection metadata lives in the browser, which suits Koyeb's ephemeral filesystem. For persistence across redeploys, switch to `STORAGE_PROVIDER=postgres` and point `STORAGE_POSTGRES_URL` at a Koyeb managed Postgres or Neon database. The button also fills in `LLM_PROVIDER`/`LLM_MODEL`/`LLM_API_KEY`, but Agent mode needs a server-held connection, so its Start button stays disabled until `STORAGE_PROVIDER` is `sqlite` or `postgres` (see [docs/AGENT.md](docs/AGENT.md#turning-it-on)). See [`deploy/koyeb/`](deploy/koyeb/).
 >
 > **Fly.io:** the repo ships a ready [`fly.toml`](fly.toml) — full steps (app name, volume, secrets) in [`docs/FLY.md`](docs/FLY.md).
 >
@@ -656,7 +679,7 @@ For a reverse-proxy path such as `/tools/libredb`, build with `BASE_PATH` and fo
 ### Koyeb
 
 1. Use the **Deploy to Koyeb** button under [One-Click Deploy](#one-click-deploy) to run the prebuilt `ghcr.io/libredb/libredb-studio:latest` image.
-2. Set a strong `JWT_SECRET` (32+ characters) and real `ADMIN_PASSWORD` / `USER_PASSWORD` in the deploy form before launching. Koyeb cannot auto-generate secrets; the prefilled values are placeholders.
+2. Set a strong `JWT_SECRET` (32+ characters) in the deploy form before launching. Koyeb cannot auto-generate secrets, and the prefilled one is shorter than the 32-character minimum on purpose, so a deployment left as it stands stops at boot and says why. No password is prefilled: leave `ADMIN_PASSWORD` unset and the app generates one on first run and prints it to the Koyeb runtime log, or set your own. `USER_PASSWORD` is not generated — without it the lower-privilege account does not exist at all, which is the safer default for a public URL.
 3. For connections to survive redeploys, set `STORAGE_PROVIDER=postgres` and `STORAGE_POSTGRES_URL` to a Koyeb managed Postgres or Neon connection string. The button defaults to `STORAGE_PROVIDER=local`, which keeps connection metadata in the browser.
 
 See [`deploy/koyeb/`](deploy/koyeb/) for the complete setup and storage options.
@@ -880,6 +903,18 @@ extraEnvFrom:
 | `SEED_CONFIG_PATH` | `/app/config/seed-connections.yaml` | Path to config file |
 | `SEED_CACHE_TTL_MS` | `60000` | Cache TTL in ms (hot-reload interval) |
 
+### One-Command Vault Demo
+
+[`docker-compose.vault-demo.yml`](docker-compose.vault-demo.yml) starts Studio, PostgreSQL and a dev-mode HashiCorp Vault, plus a one-shot init container that writes the database password into Vault and the seed file into the volume Studio mounts. It pulls the published image, so there's nothing to build, and the connection it defines takes its password from Vault through the reference `${vault:secret/data/prod/postgres#password}` instead of from an environment variable.
+
+```bash
+docker compose -f docker-compose.vault-demo.yml up
+```
+
+Open **http://localhost:3000** and log in with the admin credentials the first run prints to the Studio log, same as the [Quick Start](#quick-start). The sidebar has a **Postgres (password from Vault)** connection — open it and run any statement, and it connects with the password Vault holds. To watch a rotation, change the password in Vault and in PostgreSQL, wait out the 10-second cache the file sets, and open the connection again: it authenticates with the new value, with no container restarted.
+
+> The Vault in that file is dev mode — in-memory, root token, no TLS, no policies — so it's for demonstration only. The reference scheme, the `VAULT_*` variables, the rotation window and both rotation commands are in [`docs/SEED_CONNECTIONS.md`](docs/SEED_CONNECTIONS.md#vault-references); a real deployment starts from HashiCorp's [production hardening guide](https://developer.hashicorp.com/vault/tutorials/operations/production-hardening).
+
 ---
 
 ## Roadmap
@@ -915,9 +950,9 @@ extraEnvFrom:
 | [DeepWiki](https://deepwiki.com/libredb/libredb-studio) | AI-powered documentation — always up-to-date with the codebase |
 | [SonarCloud](https://sonarcloud.io/project/overview?id=libredb_libredb-studio) | Code quality, security analysis, and technical debt tracking |
 | [API Docs](docs/API_DOCS.md) | Complete REST API reference |
-| [Agent Guide](docs/AGENT_GUIDE.md) | Using the agent: a run, the three workflows, what "answered" means, the budget meter, and the Ollama path |
+| [Agent Guide](docs/AGENT_GUIDE.md) | Using the agent: a run, the five workflows, what "answered" means, the budget meter, and the Ollama path |
 | [Agent Data Flow](docs/AGENT_DATA_FLOW.md) | What leaves the machine, when, and to which model provider — written from call sites |
-| [Local models](docs/llms/README.md) | Which local model can actually drive an agent run, measured across three workflows, one page per model |
+| [Local models](docs/llms/README.md) | Which local model can actually drive an agent run, measured across six surfaces, one page per model |
 | [Agent Runtime](docs/AGENT.md) | Agent behaviour, bounds, deployment and known limitations |
 | [OIDC SSO](docs/OIDC.md) | SSO setup (Auth0, Keycloak, Okta, Azure AD, Zitadel, Google) + subsystem internals & security model |
 | [Two-Factor Auth](docs/MFA.md) | TOTP on the local provider — generating a secret, enrolling an app, Docker/Helm wiring, and what it does not cover |

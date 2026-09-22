@@ -16,6 +16,38 @@ export type AuditEventType =
    * to run (#328).
    */
   | "agent_operation"
+  /**
+   * A tree-driven DDL: one event for the decision to apply an edited definition and one for
+   * what the engine did with it, joined by one correlation id (#789 Phase 3).
+   *
+   * Distinct from `query_execution` on purpose, and the distinction is measured rather than
+   * argued: three DDL statements through `POST /api/db/query` added ZERO events to this ring
+   * while one VACUUM on the same connection in the same minute added exactly one, so this arm is
+   * the first record of a user's WRITE anywhere in this product and an operator filtering the log
+   * has to be able to tell it from an editor statement.
+   *
+   * The claim it makes is narrow and deliberately so: it records that an edit was applied AT THIS
+   * ADDRESS, with this strategy, and with this outcome. What it does NOT claim is WHICH statements
+   * the round trip carried, and the reason is measured rather than argued (D76).
+   *
+   * The day-one PostgreSQL unit is a multi-statement simple query with the reader's text
+   * concatenated into it, and no reader in `src/lib/sql/` can count the statements in a routine
+   * body: a dollar-quoted body may carry any number of semicolons and a `BEGIN ATOMIC` body
+   * carries them by construction. So the count is not taken here, it is ASKED OF THE ENGINE, on
+   * both sides of the plan. `buildObjectEdit` parses the reader's submitted text alone as a named
+   * prepared statement inside a transaction block it has already poisoned, and refuses a text
+   * PostgreSQL answers `42601 cannot insert multiple commands` for; `applyObjectEdit` counts the
+   * results the round trip answered, one per statement, and reports `interrupted` with
+   * `committed: "unknown"` rather than a plain `applied` when that count is not the number of
+   * statements the plan is made of.
+   *
+   * So an `applied` event is now as wide as the write in the one way a count can make it. It still
+   * says how many statements ran and never which, and it still describes one statement whose
+   * effects reach past the addressed routine by the plan's own consequence list, which for this
+   * strategy is empty. `docs/SECURITY.md` control 3.6 carries both limits, and this docblock is
+   * the shipped source's copy of them: if one moves, move the other in the same commit.
+   */
+  | "object_edit"
   // Phase 1 auth events
   | "login_success"
   | "login_failure"
@@ -49,6 +81,16 @@ export type AuditReason =
   | "oidc_no_claims"
   | "oidc_failed"
   | "oidc_config"
+  /**
+   * The login route's configuration was complete, but the provider did not answer discovery: an
+   * issuer that does not resolve, a TLS failure, a response that is not JSON or names a different
+   * issuer. (openid-client checks nothing else in the document, so one that parses but lacks an
+   * endpoint fails later, as `oidc_failed`.) Kept apart from
+   * `oidc_config` because Studio cannot tell up front whether .env is to blame (a mistyped issuer
+   * host lands here too; only the scheme is checked before discovery), and from `oidc_failed`
+   * because the login page tells the user something different for each.
+   */
+  | "oidc_discovery"
   // Agent execution path (#328). The thirteen `agent_*` codes below mirror
   // `PolicyDenyCode` one-for-one, plus the two outcomes that are not policy
   // denials: an operation that may only ever require approval, and a provider
@@ -83,7 +125,20 @@ export type AuditReason =
   // single-purpose credential. Distinct from `no_session` on purpose: this path
   // never wanted a session, so recording one vocabulary for both would make a
   // forged drive token indistinguishable in the trail from an expired login.
-  | "no_agent_drive_token";
+  | "no_agent_drive_token"
+  // The object edit path (#789 Phase 3). Eight codes for one apply's decidable outcomes, mapped
+  // from `ObjectEditOutcome` by a total record in src/lib/db/object-edit.ts, so a new outcome
+  // with no reading here fails to compile. `object_edit_plan_invalid` is the analogue of
+  // `no_agent_drive_token` and exists for the same recorded reason: without it a forged or
+  // tampered plan is indistinguishable in the trail from an ordinary failure.
+  | "object_edit_collateral_loss"
+  | "object_edit_applied_elsewhere"
+  | "object_edit_conflict"
+  | "object_edit_concurrent_update"
+  | "object_edit_refused"
+  | "object_edit_guard_refused"
+  | "object_edit_interrupted"
+  | "object_edit_plan_invalid";
 
 export interface AuditEvent {
   id: string;
@@ -114,8 +169,10 @@ export interface AuditEvent {
    * decision allowed it, the execution outcome. Server-generated per execution
    * (src/lib/db/operations/execution.ts) and opaque — it identifies an
    * execution, never a session, a user or a token, so it stays safe to log
-   * while remaining the key an operator groups by. Only `agent_operation`
-   * events set it.
+   * while remaining the key an operator groups by.
+   *
+   * Set by `agent_operation` events and by `object_edit` events, which are the two paths that
+   * emit a decision and an outcome as two records of one action (#789 Phase 3).
    */
   correlationId?: string;
 }
@@ -446,8 +503,10 @@ function toAuditLine(event: AuditEvent): AuditLogLine {
  *
  * 1. Pushes to the ring buffer the admin UI reads. That buffer is per process and holds 1000
  *    events, oldest dropped. It is a CONVENIENCE VIEW, not the durable record - an event emitted
- *    from proxy() may land in a different instance than the admin API reads, because the proxy is
- *    a separately compiled entry and instance sharing is unverified.
+ *    from proxy() ALWAYS lands in a different instance than the admin API reads, measured in #851:
+ *    Next compiles proxy.ts as its own entry which can run outside the main runtime, so the two
+ *    have separate module graphs and therefore separate buffers. Every denial proxy() records is
+ *    absent from the Admin Audit tab, which discloses that; the stdout channel below carries them.
  * 2. Writes one JSON line to stdout. This is the authoritative channel: it works identically in
  *    all 27 distribution channels with no dependency, and it is what a log pipeline consumes.
  *

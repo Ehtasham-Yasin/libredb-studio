@@ -10,9 +10,11 @@ This project and everyone participating in it is governed by our [Code of Conduc
 
 **Open an issue or a pull request in Chinese (中文) or Japanese (日本語) if that is easier for you.** You do not need fluent English to report a bug or propose a change, and a report we have to translate is far better than one you did not send. Maintainers will usually reply in English; say so if that does not work for you.
 
-This applies to the conversation, not to the repository. Everything that lands in the tree stays in English: code, comments, commit messages, documentation and the pull request title. The exceptions are the translated READMEs themselves ([README_zh.md](README_zh.md), [README_ja.md](README_ja.md)), which are maintained in their own language.
+This applies to the conversation, not to the repository. Everything that lands in the tree stays in English: code, comments, commit messages, documentation and the pull request title. The exceptions are the translated READMEs themselves ([README_es.md](README_es.md), [README_hi.md](README_hi.md), [README_ja.md](README_ja.md), [README_ur.md](README_ur.md), [README_zh.md](README_zh.md)), which are maintained in their own language.
 
 If you are updating a translated README, note that `bun run readme:check` enforces that its engine table and install commands match [README.md](README.md). Translations may cover fewer install channels, but a command must never be paraphrased - a reader copy-pastes it.
+
+Each translated README also carries a translation-lag banner: a blockquote above its first heading, in that file's own language, linking to [README.md](README.md) as the version that wins when the two disagree. `readme:check` enforces its presence, because the guard's other invariants cover the engine table, the install commands and one warning only - a translation can be stale in ways nothing in CI will report.
 
 ## How Can I Contribute?
 
@@ -59,16 +61,21 @@ Feature suggestions are welcome! Please provide:
    is unavailable.
 
    If your sandbox can reach the npm registry, `npm install -g bun` is another way to install Bun.
-   Helm is only needed for the chart tests in the test suite, not for editing the app or running
-   typecheck. The [devcontainer setup](#devcontainer--codespaces) below provides both tools.
+   Helm is only needed to run the chart tests: without it `bun run test` leaves those files out and names them, and CI runs them.
+   The [devcontainer setup](#devcontainer--codespaces) below provides both tools.
 
-   Always `bun run test`, never bare `bun test`: component tests need the isolated execution groups
-   the script sets up. `bun run test:coverage && bun run coverage:check` prints the exact uncovered
-   `file:line` ranges.
+   Always `bun run test`, never bare `bun test` over a directory: the runner gives each test file its
+   own bun process, and `bun test tests/api` puts them all in one, where one file's `mock.module()`
+   becomes every file's. To run a single file, name it: `bun tests/run-tests.ts tests/unit/x.test.ts`.
+   `bun run test:coverage && bun run coverage:check` prints the exact uncovered `file:line` ranges.
+   `bun tests/run-tests.ts --jobs=N` lowers the concurrency, which by default is one job per available CPU: that follows CPU affinity and a cgroup CPU limit, but no memory limit, and a job peaks at roughly 60 to 340 MiB.
+   Use it in a memory-limited container that has no CPU limit, and when a file comes back as killed by SIGKILL from outside the runner, which on Linux is usually the OOM killer.
+   A flag meant for `bun test` goes past a `--` the runner can see, which means invoking the runner directly with a selector first: `bun tests/run-tests.ts tests/unit -- --bail`.
+   `bun run test -- --bail` does not work, because `bun run` removes the first `--` before the script sees it, and bun removes one that sits straight after the script path too.
 5. **Keep the provider triad in lockstep.** Anything under `src/lib/db/providers/**` has a matching
    `docs/providers/<type-id>.md` and `tests/integration/db/<type-id>-provider.test.ts`; a change to
    one moves the other two in the same PR.
-6. **Localized READMEs are guarded.** `README_zh.md` and `README_ja.md` must list the same engines
+6. **Localized READMEs are guarded.** `README_es.md`, `README_hi.md`, `README_ja.md`, `README_ur.md`, and `README_zh.md` must list the same engines
    as `README.md` and quote install commands verbatim; `bun run readme:check` enforces it.
 7. **Follow the coding style**, write clear commit messages, and update documentation with the code.
 
@@ -151,7 +158,7 @@ labels above are how this repository welcomes contributors in any month.
 ### The contributor ladder
 
 Every change here lands with its tests in the same pull request, under a hard 100% line-coverage
-gate and six required checks. Clearing that bar says something about you, so we write down who
+gate and every check `main` requires. Clearing that bar says something about you, so we write down who
 cleared it and what it earns.
 
 **There is no threshold on this page, and that is deliberate.** We do not count merged pull
@@ -211,16 +218,49 @@ started by this setup.
 
 ### Prerequisites
 
-- [Bun](https://bun.sh/) (recommended) or Node.js 24+
-- Git
-- [Helm](https://helm.sh/) 4.1.3 (the version CI runs). Ten of the eleven `helm-chart-*.test.ts` files under `tests/unit/` spawn the `helm` binary - all but `helm-chart-readme-recipes.test.ts`, which is a static lint over the chart README. Without `helm` on `PATH`, `bun run test` fails with 166 `error: Executable not found in $PATH: "helm"` errors. The PostgreSQL subchart tarball is gitignored (`*.tgz`), so a fresh clone also needs:
+The suite runs on Linux, macOS and Windows, from whichever shell the platform gives you.
+`bun run test` is `bun tests/run-tests.ts`, a TypeScript runner rather than a shell script, and CI runs it on ubuntu-latest, macos-latest and windows-latest.
 
-  ```bash
-  helm repo add bitnami https://charts.bitnami.com/bitnami
-  helm dependency build charts/libredb-studio --skip-refresh
-  ```
+| Tool | Version | Needed for |
+| --- | --- | --- |
+| [Bun](https://bun.sh/) | 1.4.2, the `packageManager` pin | Installing, the dev server, the build, and the test runner itself |
+| [Node.js](https://nodejs.org/) | 24+, the `engines` floor | The `scripts/*.mjs` gates, including `merge-lcov.mjs` and `check-coverage.mjs` |
+| Git | any | Cloning, and on Windows it is also where the POSIX tools below come from |
+| [Helm](https://helm.sh/) | 4.1.3, the version CI runs | Optional locally: the chart tests, see below |
+| A POSIX shell plus `tar`, `zip`, `unzip` and `7z` | any | The packaging tests, which run the `packaging/` shell scripts and unpack what they produce |
 
-  Trap: a stale `docker login` can make that build fail with `401 Unauthorized` from `registry-1.docker.io` even though the chart is anonymously pullable. `docker logout` fixes it.
+Twelve of the thirteen `helm-chart-*.test.ts` files under `tests/unit/` spawn the `helm` binary; the exception is `helm-chart-readme-recipes.test.ts`, a static lint over the chart README.
+Each of the twelve opens with `// @requires helm`, and the runner reads that before it starts a file.
+Where `helm` is not on `PATH`, or the chart's PostgreSQL subchart is not built, `bun run test` does not start those files: it runs the rest, and its summary lists them under "Files not run on this machine" with the reason and the command that fixes it.
+Selecting only chart tests on such a machine is an error rather than an empty green run.
+CI sets `LIBREDB_REQUIRE_HELM=1`, which makes the same condition stop the run before anything starts, so the chart tests are never left out of a gate.
+If you change the chart, install Helm and run them before you push.
+A new test file that runs `helm` needs the marker too, and `tests/unit/test-runner-requirements.test.ts` fails until it has it.
+To run the chart tests, install Helm; the PostgreSQL subchart tarball is gitignored (`*.tgz`), so a fresh clone also needs:
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm dependency build charts/libredb-studio --skip-refresh
+```
+
+Trap: a stale `docker login` can make that build fail with `401 Unauthorized` from `registry-1.docker.io` even though the chart is anonymously pullable. `docker logout` fixes it.
+
+A tool your platform does not have is not a failure here.
+The tests that need it become skips whose titles carry the reason, the summary lists every one of them under its file at the end of the run, and `bun run test` still ends green.
+So the table above is what you need to run the WHOLE suite; a machine without one of those tools runs the rest of it.
+
+On Windows the POSIX tools come from the Git for Windows installation the clone already needed, and the tests locate them through git itself rather than through `PATH`.
+PowerShell's `PATH` carries `git.exe` but not the `bin` and `usr\bin` directories beside it that hold `bash.exe`, `grep.exe` and `unzip.exe`, and where WSL is installed a bare `bash` does resolve, to `C:\Windows\System32\bash.exe`, a Linux shell that cannot read the Windows temp paths the fixtures hand it.
+So `tests/helpers/posix-tools.ts` asks the git binary for its exec path, derives the installation root from it, falls back to `%LOCALAPPDATA%\Programs\Git` and the two `Program Files` defaults, and spawns each tool by absolute path; 7-Zip is looked for at `C:\Program Files\7-Zip\7z.exe` as well as on `PATH`.
+Git for Windows carries no `zip`, so the tests that build the Azure package skip there whatever else you install (`docs/BACKLOG.md` D87).
+Assertions about POSIX file modes skip on Windows in every case: NTFS has no exec bit, and Windows cannot exec an extension-less `#!` script.
+
+macOS needs nothing of its own, and the one thing that used to stop it is gone: the old shell runner called `mapfile`, a bash 4 builtin that the system bash 3.2 does not have, and the runner is TypeScript now.
+The gap that remains is `7z`, which the tests look for by that name, so an installation that provides only `7zz` leaves the standalone-zip packaging tests skipped.
+`bash`, `tar`, `zip` and `unzip` come with the system, so everything else runs.
+
+You do not need a `.env` file or a `data/` directory to run the tests.
+`tests/setup.ts`, which `bunfig.toml` preloads into every test process, pins the credentials and settings the suite runs under, so a local `.env` cannot decide a test's outcome.
 
 ### Getting Started
 
@@ -247,9 +287,9 @@ the password once to the dev-server output. Set them to pin known values instead
 (`USER_PASSWORD` additionally creates the optional non-admin account, which is
 never generated):
 ```env
-ADMIN_PASSWORD=admin123
-USER_PASSWORD=user123
-JWT_SECRET=your_32_character_random_string_here
+ADMIN_PASSWORD=
+USER_PASSWORD=
+JWT_SECRET=
 ```
 
 Optional (for AI features):
@@ -306,8 +346,8 @@ bun run format           # Biome formatter check (format:fix to write)
 bun run lint             # oxlint, then ESLint 9
 bun run typecheck        # TypeScript strict
 bun run knip             # unused files, exports and dependencies
-bun run test             # every test layer; never bare `bun test`. Needs Helm and the built subchart, see Prerequisites
-bun run test:ci          # the same layers with one process per file, which is what CI runs; use it to verify
+bun run test             # every test file, one bun process each; never bare `bun test`. Without Helm the chart tests are listed as not run, see Prerequisites
+bun run test:unit        # one layer; also test:api, test:integration, test:hooks, test:security, test:evals, test:components
 bun run test:coverage    # coverage report (merged lcov)
 bun run coverage:check   # enforce 100% line coverage on the merged lcov
 bun run readme:check     # localized README drift guard

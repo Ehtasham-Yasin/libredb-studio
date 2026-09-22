@@ -69,6 +69,20 @@ export interface DuckDBClient {
   /** True when the instance was opened read-only AND with external access disabled. */
   readonly readOnly: boolean;
   run(sql: string, params?: unknown[]): Promise<DuckDBStatementResult>;
+  /**
+   * Roll back a transaction left open on this connection, and say whether there was
+   * one to roll back (D71).
+   *
+   * It lives on the client rather than in the provider because DuckDB v1.5.5 publishes
+   * NO transaction-state reading, so the only answer available is the engine's own
+   * refusal of the ROLLBACK, and reading a driver error is driver vocabulary. Measured
+   * 2026-08-27 and re-measured 2026-09-13 on v1.5.5 / @duckdb/node-api 1.5.5-r.4:
+   * `current_transaction_id()` answers in both states (a new id per implicit
+   * transaction outside one, the transaction's own id inside), `transaction_timestamp()`
+   * is an alias of `get_current_timestamp()`, and the client context object carries only
+   * a connection id. `duckdb_functions()` lists no other candidate.
+   */
+  endOpenTransaction(): Promise<boolean>;
   /** Ask the engine to abandon whatever this connection is running. */
   interrupt(): void;
   close(): void;
@@ -93,6 +107,82 @@ export interface DuckDBOpenOptions {
  * text and is the one thing that ends the confusion, so it is kept verbatim.
  */
 const LOCK_CONFLICT_MARKER = "conflicting lock is held";
+
+/**
+ * DuckDB's own words for "you asked me to roll back and there is nothing open".
+ *
+ * Measured on v1.5.5: `ROLLBACK` on a connection with no transaction answers
+ * "TransactionContext Error: cannot rollback - no transaction is active", and the
+ * connection is untouched by the refusal — the very next statement runs normally. That
+ * is what makes an attempted rollback a safe way to ASK the question on an engine that
+ * publishes no other reading of it (see `DuckDBClient.endOpenTransaction`).
+ */
+const NO_TRANSACTION_MARKER = "cannot rollback - no transaction is active";
+
+/** The driver package, as every failure that is about its absence names it. */
+const DRIVER_PACKAGE = "@duckdb/node-api";
+
+/**
+ * What an operator is told when the driver is not installed.
+ *
+ * A constant rather than an expression inside the branch below: it names the
+ * remedy, which is the only reason this message exists, and a module-level
+ * string cannot drift out of the coverage the branch has.
+ */
+const DRIVER_ABSENT_MESSAGE =
+  `DuckDB is not available in this deployment: the ${DRIVER_PACKAGE} driver is not installed. ` +
+  "The libredb-studio -alpine-slim image leaves it out to stay small; the default and -alpine tags ship it. " +
+  "Use one of those tags, or install the driver, to open DuckDB connections.";
+
+/**
+ * The absence of the driver package, told apart from every other import failure
+ * (issue #840).
+ *
+ * The `-alpine-slim` image ships without `@duckdb/node-api` deliberately - it is
+ * four packages ending in a ~70 MB `libduckdb.so`, the largest removable item in
+ * that image - so on that tag this import is expected to fail, and the operator
+ * needs to be told which tags do carry it. Raw, the failure reads as
+ * "Failed to load external module @duckdb/node-api-<hash>: Error: Cannot find
+ * module ... Require stack: - /app/.next/server/chunks/...", which answers
+ * neither question and prints the deployment's own file layout into a browser
+ * toast.
+ *
+ * NARROW ON PURPOSE. Only a resolution failure that NAMES THIS PACKAGE is
+ * translated; anything else answers null and is re-raised untouched by the
+ * caller. "DuckDB is not installed in this image" is a false statement about a
+ * corrupt binding or about some other dependency going missing, and it would
+ * send the operator off to change tags over an unrelated fault.
+ */
+export function describeDriverAbsence(error: unknown): ConnectionError | null {
+  if (!(error instanceof Error)) return null;
+
+  const code = (error as Error & { code?: unknown }).code;
+  const unresolved =
+    code === "MODULE_NOT_FOUND" || code === "ERR_MODULE_NOT_FOUND" || error.message.includes("Cannot find module");
+  if (!unresolved || !error.message.includes(DRIVER_PACKAGE)) return null;
+
+  return new ConnectionError(DRIVER_ABSENT_MESSAGE, "duckdb");
+}
+
+/**
+ * The driver import, behind its own function so the absence path has a seam.
+ *
+ * The loader is a parameter with a default rather than a module-scope import:
+ * making a real import fail is not something a test can arrange, and both arms
+ * of the catch below are load-bearing. The default is the one production uses
+ * and is exercised by every DuckDB integration test.
+ */
+export async function loadDuckDBDriver(
+  load: () => Promise<typeof import("@duckdb/node-api")> = () => import("@duckdb/node-api"),
+): Promise<typeof import("@duckdb/node-api")> {
+  try {
+    return await load();
+  } catch (error) {
+    const absence = describeDriverAbsence(error);
+    if (absence) throw absence;
+    throw error;
+  }
+}
 
 /** The PID DuckDB named as holding the lock, when its message names one. */
 export function readLockHolderPid(message: string): number | null {
@@ -165,8 +255,9 @@ export function describeOpenFailure(error: unknown, path: string, readOnly: bool
  * unaffected by this change.
  */
 export async function openDuckDBClient(path: string, options: DuckDBOpenOptions): Promise<DuckDBClient> {
-  // Inside the function, never at module scope - see the file header.
-  const { DuckDBInstance: Instance } = await import("@duckdb/node-api");
+  // Inside the function, never at module scope - see the file header. Through
+  // loadDuckDBDriver so that a deployment without the driver says so (#840).
+  const { DuckDBInstance: Instance } = await loadDuckDBDriver();
 
   let instance: DuckDBInstance;
   let connection: DuckDBConnection;
@@ -197,6 +288,19 @@ export async function openDuckDBClient(path: string, options: DuckDBOpenOptions)
         rows: reader.getRowObjectsJson() as Record<string, unknown>[],
         rowsChanged: reader.rowsChanged,
       };
+    },
+    async endOpenTransaction(): Promise<boolean> {
+      try {
+        await connection.run("ROLLBACK");
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Only the engine's own "there was nothing to roll back" is an answer. Anything
+        // else is a real failure and is raised: a rollback that failed for another
+        // reason has left the connection in a state this seam must not paper over.
+        if (message.includes(NO_TRANSACTION_MARKER)) return false;
+        throw error;
+      }
     },
     interrupt(): void {
       connection.interrupt();

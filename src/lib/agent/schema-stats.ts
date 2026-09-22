@@ -7,7 +7,7 @@
  * needs an index, whether a `GROUP BY` is answerable at all — turns on exactly that.
  * The honest way to obtain it is NOT to count: `COUNT(DISTINCT col)` per column is a
  * full scan, and this mode's whole selling point is that it can be pointed at
- * production. Both served engines already hold the numbers, so this module reads
+ * production. Every served engine already holds the numbers, so this module reads
  * what they hold and refuses to improve on it.
  *
  * It is its own module rather than part of `context-snapshot.ts` for a reason that is
@@ -42,8 +42,10 @@
 
 import { AgentComposedSqlError, type AgentCatalogSelector, composeStatisticsAvailabilityProbe } from "./composed-sql";
 import { type AgentToolContext, readCatalogForGrounding, readStatementForGrounding } from "./tools";
+import { addressableObjects } from "./inventory-objects";
 import { fenceUntrustedContent } from "./untrusted-content";
-import type { DatabaseType, TableSchema } from "@/lib/types";
+import type { AgentInventory } from "./types";
+import type { DatabaseType } from "@/lib/types";
 
 /** Why a run has no statistics. All four are states the run continues from. */
 export type AgentStatisticsUnavailableCode =
@@ -78,7 +80,11 @@ export interface AgentColumnEstimate {
 export interface AgentTableEstimate {
   /** The engine's row estimate, or `null` where it has never counted this table. */
   readonly estimatedRows: number | null;
-  /** Empty where the engine holds no per-column distribution — which is all of SQLite. */
+  /**
+   * Empty where this run has no per-column distribution to report. That is all of SQLite,
+   * which records none at all, and all of SQL Server, which records them behind a DBCC
+   * command this boundary refuses — see `buildMssqlEstimates` for that distinction.
+   */
   readonly columns: readonly AgentColumnEstimate[];
 }
 
@@ -180,11 +186,46 @@ function buildSqliteEstimates(rows: readonly Record<string, unknown>[]): Map<str
   return byTable;
 }
 
+/**
+ * SQL Server's rows: one per USER TABLE, from `composeMssqlStatistics` - the sum of
+ * `sys.partitions.rows` over the heap or clustered index (`index_id IN (0, 1)`).
+ *
+ * Keyed `schema.table`, the same shape `buildPostgresEstimates` produces, because the
+ * inventory addresses a SQL Server object by the same qualified name and the packing
+ * joins the two by that key alone.
+ *
+ * `columns` is empty, and that is this READ's limit rather than the engine's: SQL Server
+ * does hold per-column distributions, but only behind `DBCC SHOW_STATISTICS`, which is a
+ * DBCC command rather than a read and is refused by the admission step and by the shared
+ * statement guard alike (`composeMssqlStatistics` records the same reasoning). The
+ * table half is what a catalog read can honestly answer here, exactly as on SQLite and
+ * DuckDB.
+ *
+ * There is no -1 case to unwind the way PostgreSQL's `reltuples` has one: `sys.partitions`
+ * carries a maintained count and a table with no rows arrives as 0. An unreadable value
+ * becomes absence through `numeric`, which is what keeps a driver that hands a `bigint`
+ * back as text from printing as `NaN` rows. Measured on AdventureWorks2022: the composed
+ * read answers 72 rows, one per user table.
+ */
+function buildMssqlEstimates(rows: readonly Record<string, unknown>[]): Map<string, AgentTableEstimate> {
+  const byTable = new Map<string, AgentTableEstimate>();
+
+  for (const row of rows) {
+    byTable.set(`${text(row.table_schema)}.${text(row.table_name)}`, {
+      estimatedRows: numeric(row.estimated_rows),
+      columns: [],
+    });
+  }
+
+  return byTable;
+}
+
 const ESTIMATE_BUILDERS: Partial<
   Record<DatabaseType, (rows: readonly Record<string, unknown>[]) => Map<string, AgentTableEstimate>>
 > = {
   postgres: buildPostgresEstimates,
   sqlite: buildSqliteEstimates,
+  mssql: buildMssqlEstimates,
 };
 
 /**
@@ -345,7 +386,7 @@ function renderTable(name: string, estimate: AgentTableEstimate | undefined, det
 /**
  * The statistics, against the inventory they describe, as text for a prompt.
  *
- * Driven from the INVENTORY's table list rather than from the reading's keys, which
+ * Driven from the INVENTORY's own entries rather than from the reading's keys, which
  * is what makes absence expressible at all: a table the engine holds nothing for gets
  * its own line saying so. A reading keyed on a table the inventory does not carry is
  * dropped — it is a table the model was never shown and cannot write about.
@@ -361,11 +402,16 @@ function renderTable(name: string, estimate: AgentTableEstimate | undefined, det
  * has to guess at (#350).
  */
 export function packSchemaStatistics(
-  tables: readonly TableSchema[],
+  inventory: AgentInventory,
   statistics: AgentSchemaStatistics,
   options: { readonly maxChars?: number; readonly detail?: AgentStatisticsDetail } = {},
 ): string {
   const detail = options.detail ?? "rows-and-columns";
+  // The inventory carries every kind the engine declared (#789), and every line below says
+  // "this table": a routine given one would be told it has an unknown size, which is a
+  // category error dressed as a fact. The gate is the declared role, so a relation kind
+  // this repository has never heard of is reported like any other.
+  const tables = addressableObjects(inventory);
   if (statistics.kind === "unavailable") {
     return [
       `No estimated table statistics are available to this run: ${UNAVAILABLE_REASON[statistics.reasonCode]}.`,

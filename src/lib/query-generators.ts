@@ -119,19 +119,47 @@ export function quoteIdentifier(name: string, capabilities: ProviderCapabilities
 }
 
 /**
- * Quote a possibly schema-qualified name (e.g. `employees.department`) by quoting
- * each dotted segment independently. Quoting the whole string as one identifier
- * (`"employees.department"`) would make the database look for a single relation
- * literally named with a dot, which fails. Each segment is still quoted only when
- * needed, so `employees.department` stays unquoted and `public.Order` becomes
- * `public."Order"`.
+ * Quote an object ADDRESS: one segment per container level, then the object's own
+ * segment, each quoted independently and joined with `.`.
+ *
+ * Segments in and never a string to split, which is the whole of the rule. A name is
+ * what LABELS an object and a path is what ADDRESSES it (#789), and the string form
+ * below could only guess where one segment ends: a ClickHouse table really named
+ * `.inner_id.fake` in `demo` generated `SELECT * FROM "".inner_id.fake`, which the
+ * server answers with a syntax error at position 15, because the dots in its NAME were
+ * read as qualifiers. Reproduced in the browser on ClickHouse 25.8 before this changed.
+ *
+ * Quoting stays per segment and stays conditional, so `["employees", "department"]` is
+ * still `employees.department` and `["public", "Order"]` is still `public."Order"`.
+ *
+ * Full qualification is emitted unconditionally, including inside the session default
+ * container. `demo.orders`, `[libredb_objects].[app].[customers]` and `APP.APP_CUSTOMERS`
+ * are all valid wherever the bare name is, so nothing here has to know which container a
+ * connection defaults to - and no capability declares that, which is why the flat spelling
+ * could not be qualified at the call site.
  */
-export function quoteQualifiedName(name: string, capabilities: ProviderCapabilities): string {
-  if (capabilities.queryLanguage === "json") return name;
-  return name
-    .split(".")
-    .map((part) => quoteIdentifier(part, capabilities))
-    .join(".");
+export function quoteObjectPath(path: readonly string[], capabilities: ProviderCapabilities): string {
+  if (capabilities.queryLanguage === "json") return path.join(".");
+  return path.map((segment) => quoteIdentifier(segment, capabilities)).join(".");
+}
+
+/**
+ * The object's own segment, which is the LAST one and is never read by index 0 (standing
+ * ruling 5g): at container depth 2 the object is `path[2]`, and a positional read there
+ * addresses a container instead.
+ *
+ * An empty path is refused rather than rendered. It is a caller that lost the address, and
+ * every dialect below would otherwise spell it silently: `FROM ` on SQL, `get ` on LibreDB,
+ * `"collection": undefined` on MongoDB. Both generators resolve it before they branch, so
+ * one refusal covers every dialect.
+ *
+ * Exported for `useTabManager`, which names the tab it opens after the object and has the
+ * same two reasons to read the last segment and to refuse an empty address.
+ */
+export function objectSegment(path: readonly string[]): string {
+  const segment = path[path.length - 1];
+  if (segment === undefined) throw new Error("Cannot generate a query: the object address has no segments.");
+  return segment;
 }
 
 /**
@@ -159,7 +187,7 @@ function commentName(name: string): string {
  * the literal prefix used in commands (`users:*` -> `users:`).
  *
  * Shared by the LibreDB and Redis branches: both build their tree from the same
- * `getKeyPrefix` grouping, so a future change to what a prefix node looks like
+ * `keyGrouping` grouping, so a future change to what a prefix node looks like
  * must not be able to make the two dialects disagree (#427).
  */
 function prefixGroup(name: string): { isPrefixGroup: boolean; base: string } {
@@ -189,7 +217,7 @@ function libredbExampleForType(type: string): unknown {
  *  - document collection (`id`/`document`) → a small JSON object
  *  - relational table → a JSON object built from the declared columns
  */
-function libredbExampleValue(columns: ColumnSchema[]): string {
+function libredbExampleValue(columns: readonly ColumnSchema[]): string {
   if (columns.length === 2 && columns[0]?.name === "key" && columns[1]?.name === "value") {
     return "example";
   }
@@ -298,7 +326,7 @@ function escapeGlob(value: string): string {
  * `"string, hash"` (a mixed prefix) deliberately do not. The `value` column
  * carries the same sample joined with `/` and exists for display only (#427).
  */
-function redisKeyType(columns?: ColumnSchema[]): RedisKeyType | null {
+function redisKeyType(columns?: readonly ColumnSchema[]): RedisKeyType | null {
   const sample = columns?.find((c) => c.name === "type")?.type;
   const parts = (sample || "")
     .split(",")
@@ -321,10 +349,17 @@ function redisScan(base: string): string {
  *
  * Only the two shapes a user reaches by CLICKING are bounded here - the schema tree's
  * "Select Top N" and "Generate Query" - because those are the statements this file
- * writes on the user's behalf. The dialect-specific returns above keep their own
- * literal `;`: each of those engines accepts one, and this is the fallthrough every
- * other SQL engine shares, which is where the two search products land. See
- * `ProviderCapabilities.statementTerminator` for the measurement.
+ * writes on the user's behalf.
+ *
+ * `generateTableQuery`'s returns all ask this now. They did not always: Oracle and SQL
+ * Server had branches of their own to spell their row bound, and #816 removed the bound,
+ * which left the two branches doing nothing the shared return did not. `generateSelectQuery`
+ * still keeps a literal `;` in its SQL Server and Couchbase branches, because both accept
+ * one and neither branch has been touched.
+ *
+ * Oracle is the measurement that moved: `SELECT * FROM app_customers FETCH FIRST 50
+ * ROWS ONLY;` answers ORA-00933, so clicking a table on Oracle had never once worked.
+ * See `ProviderCapabilities.statementTerminator` for both measurements.
  */
 function terminator(capabilities: ProviderCapabilities): string {
   return capabilities.statementTerminator === "none" ? "" : ";";
@@ -350,11 +385,33 @@ function libredbNewlineNote(base: string): string | null {
   return "# This key's name contains a line break. LibreDB commands are line-oriented, so no generated line can address it.";
 }
 
+/**
+ * The statement behind "Select Top 50", the one a CLICK on a tree row runs (#789).
+ *
+ * It takes the object's PATH, because that is what addresses an object; `name` is what
+ * labels it (standing ruling 2). Every dialect below that addresses by qualification gets
+ * the whole path, and the three that address a single key or collection get the object's
+ * own segment.
+ *
+ * NO SQL RETURN HERE CARRIES A ROW BOUND (#816). It used to: `LIMIT 50`, `FETCH FIRST 50
+ * ROWS ONLY`, `SELECT TOP 50`. Nothing downstream could then tell that preview cap from a
+ * bound the user typed, because both are text in the same string — and the limiter
+ * returns a self-bounded statement UNTOUCHED, discarding the offset with it, so the page
+ * after the first was the first again. The cap travels as the `limit` EXECUTION OPTION
+ * instead (`PREVIEW_PAGE_SIZE` in `use-tab-manager.ts`), which leaves a user-written
+ * `LIMIT n` with exactly one meaning: a hard bound we do not page past.
+ *
+ * The two JSON-language branches keep their own bound, and that is not an exception to
+ * the rule. Neither MongoDB nor Redis can be asked for page two at all
+ * (`supportsResultPagination: false`, measured), so their bound is the only one there is
+ * and no control is offered that a preview cap in the text could disengage.
+ */
 export function generateTableQuery(
-  tableName: string,
+  path: readonly string[],
   capabilities: ProviderCapabilities,
-  columns?: ColumnSchema[],
+  columns?: readonly ColumnSchema[],
 ): string {
+  const tableName = objectSegment(path);
   // LibreDB speaks its own command grammar (get/put/delete/prefix/range), not SQL
   // and not MongoDB JSON. "Scan" lists everything under the group's prefix.
   if (capabilities.queryDialect === "libredb") {
@@ -379,24 +436,18 @@ export function generateTableQuery(
   if (capabilities.queryLanguage === "json") {
     return JSON.stringify({ collection: tableName, operation: "find", filter: {}, options: { limit: 50 } }, null, 2);
   }
-  const table = quoteQualifiedName(tableName, capabilities);
-  // Couchbase (SQL++)
+  const table = quoteObjectPath(path, capabilities);
+  // Couchbase (SQL++). The one SQL branch left, and it is about the PROJECTION: the
+  // document key is not a column, so the grid has nothing to show without the alias.
   if (capabilities.defaultPort === COUCHBASE_PORT) {
-    return `SELECT ${COUCHBASE_KEY_PROJECTION}, ${COUCHBASE_ALIAS}.* FROM ${table} AS ${COUCHBASE_ALIAS} LIMIT 50;`;
+    return `SELECT ${COUCHBASE_KEY_PROJECTION}, ${COUCHBASE_ALIAS}.* FROM ${table} AS ${COUCHBASE_ALIAS}${terminator(capabilities)}`;
   }
-  // Oracle
-  if (capabilities.defaultPort === 1521) {
-    return `SELECT * FROM ${table} FETCH FIRST 50 ROWS ONLY;`;
-  }
-  // MSSQL
-  if (capabilities.defaultPort === 1433) {
-    return `SELECT TOP 50 * FROM ${table};`;
-  }
-  // PostgreSQL / MySQL / SQLite / ClickHouse / Elasticsearch / OpenSearch. The
-  // trailing LIMIT matters for ClickHouse specifically: it also accepts `FORMAT x`
-  // and `SETTINGS ...` as trailing clauses, and a LIMIT placed after either is a
-  // syntax error, so the limit must stay last (issue #264).
-  return `SELECT * FROM ${table} LIMIT 50${terminator(capabilities)}`;
+  // Every other SQL dialect, Oracle and SQL Server included. They had branches of their
+  // own only to spell their row bound — `FETCH FIRST 50 ROWS ONLY` and `SELECT TOP 50` —
+  // and with no bound to spell, one statement serves all of them. Issue #264's rule, that
+  // a ClickHouse bound must sit after any `FORMAT` or `SETTINGS` clause, is moot for the
+  // same reason: there is no generated bound to misplace.
+  return `SELECT * FROM ${table}${terminator(capabilities)}`;
 }
 
 /**
@@ -405,7 +456,7 @@ export function generateTableQuery(
  * any line works as-is). The provider skips `#` comment and blank lines, so
  * running the whole buffer runs its first real command.
  */
-function libredbCheatsheet(tableName: string, columns: ColumnSchema[]): string {
+function libredbCheatsheet(tableName: string, columns: readonly ColumnSchema[]): string {
   const { isPrefixGroup, base } = prefixGroup(tableName);
   const value = libredbExampleValue(columns);
   const header = `# LibreDB commands for ${commentName(tableName)} — select a line and Run Selected.`;
@@ -455,7 +506,7 @@ function libredbCheatsheet(tableName: string, columns: ColumnSchema[]): string {
  * arguments are literal byte strings, so `DEL user:*` would delete nothing (or
  * the wrong thing) rather than the group (#427).
  */
-function redisCheatsheet(tableName: string, columns: ColumnSchema[]): string {
+function redisCheatsheet(tableName: string, columns: readonly ColumnSchema[]): string {
   const { isPrefixGroup, base } = prefixGroup(tableName);
   const key = isPrefixGroup ? `${base}1` : base;
   const keyType = redisKeyType(columns);
@@ -495,11 +546,26 @@ function redisCheatsheet(tableName: string, columns: ColumnSchema[]): string {
   return lines.join("\n");
 }
 
+/**
+ * The statement behind "Generate Query", which is written into a tab and NOT run.
+ *
+ * Takes the object's PATH for the same reason `generateTableQuery` does, and the two stay
+ * in step: a user who clicks a row and a user who asks for the statement must be handed
+ * the same address.
+ *
+ * IT KEEPS ITS `LIMIT 100`, and #816 left it there deliberately. The bound left
+ * `generateTableQuery` because that statement is RUN on the user's behalf, so its cap was
+ * the product's own and had to be distinguishable from one the user typed. This one is
+ * written into the editor and run only if the user presses Run, at which point it is a
+ * statement they chose to execute and its bound is theirs: a hard bound, honoured, and not
+ * paged past. Removing it would instead hand them an unbounded scan they never asked for.
+ */
 export function generateSelectQuery(
-  tableName: string,
-  columns: ColumnSchema[],
+  path: readonly string[],
+  columns: readonly ColumnSchema[],
   capabilities: ProviderCapabilities,
 ): string {
+  const tableName = objectSegment(path);
   // LibreDB: emit an explanatory cheatsheet — a use-case comment above each
   // command — where every command line is a concrete, directly-runnable example
   // (so "Run Selected" on any line works as-is). The provider skips `#` comment
@@ -529,7 +595,7 @@ export function generateSelectQuery(
       2,
     );
   }
-  const table = quoteQualifiedName(tableName, capabilities);
+  const table = quoteObjectPath(path, capabilities);
   // Couchbase (SQL++): every field is reached through the keyspace alias, and the
   // document key comes from META() rather than from the document body.
   if (capabilities.defaultPort === COUCHBASE_PORT) {
@@ -544,7 +610,7 @@ export function generateSelectQuery(
   const cols = columns.map((c) => `  ${quoteIdentifier(c.name, capabilities)}`).join(",\n") || "  *";
   // Oracle
   if (capabilities.defaultPort === 1521) {
-    return `SELECT\n${cols}\nFROM ${table}\nWHERE 1=1\nFETCH FIRST 100 ROWS ONLY;`;
+    return `SELECT\n${cols}\nFROM ${table}\nWHERE 1=1\nFETCH FIRST 100 ROWS ONLY${terminator(capabilities)}`;
   }
   // MSSQL
   if (capabilities.defaultPort === 1433) {
